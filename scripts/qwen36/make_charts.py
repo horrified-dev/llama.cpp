@@ -12,9 +12,9 @@ OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs
 
 THEMES = {
     "light": dict(surface="#fcfcfb", ink="#0b0b0b", ink2="#52514e", muted="#6f6e69", grid="#e1e0d9", base="#c3c2b7",
-                  s1="#2a78d6", s2="#eb6834", gray="#9a9993"),
+                  s1="#2a78d6", s2="#eb6834", s3="#1baf7a", s4="#eda100", gray="#9a9993", on_fill="#0b0b0b"),
     "dark":  dict(surface="#1a1a19", ink="#f0efec", ink2="#c3c2b7", muted="#9a9993", grid="#2c2c2a", base="#4a4a46",
-                  s1="#3987e5", s2="#d95926", gray="#7a7973"),
+                  s1="#3987e5", s2="#d95926", s3="#199e70", s4="#c98500", gray="#7a7973", on_fill="#0b0b0b"),
 }
 
 FONT = "system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
@@ -43,6 +43,9 @@ class Svg:
         d = (f"M{x0:.1f},{y0:.1f} H{x1 - r:.1f} Q{x1:.1f},{y0:.1f} {x1:.1f},{y0 + r:.1f} V{y1 - r:.1f} "
              f"Q{x1:.1f},{y1:.1f} {x1 - r:.1f},{y1:.1f} H{x0:.1f} Z")
         self.el.append(f'<path d="{d}" fill="{self.t[color]}"/>')
+
+    def rect(self, x, y, w, h, color, r=4):
+        self.el.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" rx="{r}" fill="{self.t[color]}"/>')
 
     def polyline(self, pts, color):
         p = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
@@ -161,6 +164,99 @@ def line_chart(name, mode, title, subtitle, xs, xticks, series, ymax, ystep, yfm
     svg.save(os.path.join(OUT, f"{name}-{mode}.svg"))
 
 
+def stacked_bar_chart(name, mode, title, subtitle, parts, xmax, xstep, unit, note, desc=""):
+    # one part-to-whole bar, 2 px surface gaps between the segments, every segment labeled in the legend
+    t = THEMES[mode]
+    h = 214
+    x0, x1 = PAD + 8, W - 40
+    y, thick = 84, 28
+    svg = Svg(t, W, h, title, desc or title)
+    header(svg, title, subtitle)
+
+    def sx(v):
+        return x0 + (x1 - x0) * v / xmax
+
+    for v in range(0, xmax + 1, xstep):
+        svg.line(sx(v), y - 8, sx(v), y + thick + 8, "grid")
+        svg.text(sx(v), y + thick + 20, f"{v}", size=11, color="muted", anchor="middle")
+    total = sum(p[2] for p in parts)
+    acc = 0.0
+    for i, (label, color, v) in enumerate(parts):
+        a, b = sx(acc), sx(acc + v)
+        gap = 0 if i == len(parts) - 1 else 2
+        if i == len(parts) - 1:
+            svg.hbar(a, b, y + thick / 2, thick, color)
+        else:
+            svg.rect(a, y, b - a - gap, thick, color, r=0)
+        if b - a > 60:
+            svg.text((a + b) / 2, y + thick / 2, f"{v:g} {unit}", size=12, color="on_fill", anchor="middle", weight=600)
+        acc += v
+    svg.line(x0, y - 8, x0, y + thick + 8, "base")
+    lx, ly = PAD, y + thick + 52
+    for label, color, v in parts:
+        item = f"{label}  {v:g} {unit} ({100 * v / total:.0f}%)"
+        svg.swatch(lx, ly, color, "bar")
+        svg.text(lx + 18, ly, item, size=12, color="ink2")
+        lx += 18 + text_w(item, 12) + 20
+    svg.text(PAD, h - 14, note, size=11, color="muted")
+    svg.save(os.path.join(OUT, f"{name}-{mode}.svg"))
+
+
+def timeline_schematic(name, mode, desc):
+    # not data: a schematic of one layer boundary during single-token decode, stock vs. this fork
+    t = THEMES[mode]
+    title = "CPU and GPU timeline of a decode step"
+    h = 440
+    x0, x1 = PAD + 150, W - 24
+    svg = Svg(t, W, h, title, desc)
+    header(svg, title, "Schematic, not to scale: two consecutive MoE layers whose routed experts are in system RAM")
+    tmax = 80.0
+
+    def sx(v):
+        return x0 + (x1 - x0) * v / tmax
+
+    lanes = ["GPU", "CPU compute threads", "Prefetch helpers"]
+    lane_h, lane_step = 26, 34
+    panels = [
+        ("Stock llama.cpp", 104, [
+            ("CPU compute threads", 0, 24, "s2", "experts of layer L"),
+            ("GPU", 24, 42, "s1", "mixer L+1"),
+            ("CPU compute threads", 42, 66, "s2", "experts of layer L+1"),
+            ("GPU", 66, 80, "s1", "mixer L+2"),
+        ]),
+        ("This fork", 262, [
+            ("CPU compute threads", 0, 24, "s2", "experts of layer L"),
+            ("CPU compute threads", 24, 25.5, "gray", None),
+            ("GPU", 25.5, 43.5, "s1", "mixer L+1"),
+            ("Prefetch helpers", 25.5, 43.5, "s3", "load predicted"),
+            ("CPU compute threads", 43.5, 62, "s2", "experts of L+1"),
+            ("GPU", 62, 80, "s1", "mixer L+2"),
+        ]),
+    ]
+    for ptitle, top, blocks in panels:
+        svg.text(PAD, top - 16, ptitle, size=13, color="ink", weight=600)
+        for i, lane in enumerate(lanes):
+            yy = top + i * lane_step
+            svg.text(x0 - 10, yy + lane_h / 2, lane, size=12, color="ink2", anchor="end")
+            svg.line(x0, yy + lane_h / 2, x1, yy + lane_h / 2, "grid")
+        for lane, a, b, color, label in blocks:
+            yy = top + lanes.index(lane) * lane_step
+            svg.rect(sx(a), yy, sx(b) - sx(a) - 2, lane_h, color)
+            if label:
+                svg.text((sx(a) + sx(b)) / 2, yy + lane_h / 2, label, size=11.5, color="on_fill", anchor="middle", weight=600)
+    top = panels[1][1]
+    ycpu = top + lanes.index("CPU compute threads") * lane_step
+    yh = top + lanes.index("Prefetch helpers") * lane_step
+    svg.text(sx(25.5) - 4, ycpu + lane_h + 12, "predict", size=10.5, color="ink2", anchor="end")
+    svg.text(sx(43.5) + 8, yh + lane_h / 2, "stops when the real experts are known", size=11, color="ink2")
+    svg.line(sx(62), ycpu + lane_h / 2, sx(66), ycpu + lane_h / 2, "ink2", 2)
+    svg.line(sx(66), ycpu + 4, sx(66), ycpu + lane_h - 4, "ink2", 1)
+    svg.text(sx(66) + 6, ycpu + lane_h / 2, "time saved", size=11, color="ink2")
+    svg.text(PAD, h - 52, "mixer = the attention or Gated DeltaNet block of a layer, plus its shared expert and router, all on the GPU.", size=11, color="muted")
+    svg.text(PAD, h - 34, "While it runs, the 16 compute cores idle. Helpers on their SMT siblings load the rows of the predicted experts", size=11, color="muted")
+    svg.text(PAD, h - 16, "into the shared caches, so the next expert matmuls wait less on DRAM.", size=11, color="muted")
+    svg.save(os.path.join(OUT, f"{name}-{mode}.svg"))
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     stages = ["Stock llama.cpp, best flags", "+ MTP draft head (2 tokens)", "+ n-gram drafts", "+ expert prefetch (this fork)"]
@@ -198,13 +294,13 @@ def main():
         line_chart(
             "prompt-offload", mode,
             "Short prompts: where to run the experts",
-            "Time to process a new prompt chunk, 128K profile",
+            "llama-bench, -ncmoe 33 -ub 1024: experts uploaded to the GPU (op offload) vs. run on the CPU",
             [32, 64, 128, 192, 256, 512, 1024], [(v, str(v)) for v in (32, 64, 128, 256, 512, 1024)],
             [("Experts streamed to the GPU", "s1", [0.354, 0.489, 0.641, 0.722, 0.808, 1.010, 1.315], "GPU  1.32 s"),
              ("Experts on the CPU", "s2", [0.229, 0.344, 0.534, 0.704, 0.867, 1.694, 3.172], "CPU  3.17 s")],
             3.5, 0.5, "{:.1f}", "seconds",
-            ("x-axis: new prompt tokens (log scale). Streaming the experts over PCIe has a fixed cost of ~0.3 s,",
-             "so chunks below 192 tokens are faster on the CPU (an agentic turn is often only 15-600 tokens)."),
+            ("x-axis: new prompt tokens (log scale). The GPU path uploads every expert the chunk routes to, and even",
+             "short chunks route to many, so below 192 tokens the CPU path is faster (agentic turns: often 15-600 tokens)."),
             logx=True, vline=(192, "GGML_OP_OFFLOAD_MIN_BATCH=192"),
             desc="Tokens 32, 64, 128, 192, 256, 512, 1024. GPU: 0.354, 0.489, 0.641, 0.722, 0.808, 1.010, 1.315 s. "
                  "CPU: 0.229, 0.344, 0.534, 0.704, 0.867, 1.694, 3.172 s.")
@@ -217,6 +313,18 @@ def main():
             1200, 200,
             "Real agentic turns (3.7K to 11K new tokens): 351-377 tok/s at 262K context, 563-617 tok/s at 128K.",
             fmt="{:.0f}", desc="487, 761, 1135 tok/s.")
+        stacked_bar_chart(
+            "step-breakdown", mode,
+            "Where the time of one decode step goes",
+            "MTP speculative decoding, 128K profile: one step verifies the drafts and yields 2.6 tokens on average",
+            [("CPU experts", "s2", 46), ("GPU", "s1", 16), ("Drafting", "s3", 4.6), ("Copies", "s4", 1.3)],
+            70, 10, "ms",
+            "CPU experts: 33 layers of routed experts read from DDR4. GPU: attention, Gated DeltaNet, shared experts, last 7 layers.",
+            desc="CPU experts 46 ms, GPU 16 ms, drafting 4.6 ms, copies 1.3 ms.")
+        timeline_schematic(
+            "prefetch-timeline", mode,
+            "Schematic: in stock llama.cpp the CPU idles while the GPU runs the next layer; in this fork helper threads "
+            "load the predicted experts during that time, so the next expert computation is shorter.")
 
 
 if __name__ == "__main__":
