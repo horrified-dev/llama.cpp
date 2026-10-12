@@ -2667,6 +2667,8 @@ struct llama_model_qwen4exp : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llama_moe_prefetch_layer;
+
 struct llama_model_qwen35moe : public llama_model_base {
     llama_model_qwen35moe(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -2691,6 +2693,10 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        void build_moe_post_routing(ggml_tensor * selected_experts, int il) const override;
+
+        void build_moe_post_experts(ggml_tensor * inp, int il) const override;
+
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,
                     ggml_tensor * weights,
@@ -2703,6 +2709,9 @@ struct llama_model_qwen35moe : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+
+        // per layer, the prefetch state of the host experts, nullptr if they are not prefetched
+        mutable std::vector<llama_moe_prefetch_layer *> moe_prefetch;
     };
 
     struct graph_mtp : public llm_graph_context {

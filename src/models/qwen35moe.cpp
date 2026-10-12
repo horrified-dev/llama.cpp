@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-moe-prefetch.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
@@ -40,7 +41,8 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // only a few rows are read per ubatch, so the table can stay on disk (with --lazy-mode on)
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_READ_LAZY);
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
@@ -173,6 +175,8 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    moe_prefetch.assign(n_layer, nullptr);
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
@@ -489,6 +493,71 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
 
     return cur;
+}
+
+// the host experts of layer il, empty if some of them are not in host memory
+static std::vector<const ggml_tensor *> qwen35moe_host_experts(const llama_layer & layer) {
+    std::vector<const ggml_tensor *> res;
+    for (const ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+        if (t == nullptr) {
+            continue;
+        }
+        if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+            return {};
+        }
+        res.push_back(t);
+    }
+    return res;
+}
+
+// predict the experts of the next layer and prefetch them while the GPU computes the attention of the next layer
+// inp is the input of the experts of this layer, the prediction runs on the CPU after the experts of this layer
+void llama_model_qwen35moe::graph::build_moe_post_experts(ggml_tensor * inp, const int il) const {
+    const int32_t n_pred = llama_moe_prefetch_n_expert();
+
+    // larger batches select most of the experts, the prediction covers too little of them
+    if (n_pred <= 0 || n_tokens > llama_moe_prefetch_max_tokens() || il + 1 >= n_layer) {
+        return;
+    }
+
+    const auto & layer = model.layers[il];
+    const auto & next  = model.layers[il + 1];
+
+    if (qwen35moe_host_experts(layer).empty()) {
+        return;
+    }
+    const std::vector<const ggml_tensor *> experts = qwen35moe_host_experts(next);
+    if (experts.empty()) {
+        return;
+    }
+
+    const int32_t n_threads = n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads;
+
+    llama_moe_prefetch_layer * pl = llama_moe_prefetch_get_layer(experts, n_threads, next.ffn_gate_inp, layer.attn_post_norm, next.attn_post_norm);
+    if (pl == nullptr) {
+        return;
+    }
+
+    ggml_tensor * logits = ggml_mul_mat(ctx0, pl->router, inp); // [n_expert, n_tokens]
+    cb(logits, "moe_prefetch_logits", il + 1);
+
+    ggml_tensor * kick = ggml_custom_4d(ctx0, GGML_TYPE_I32, 1, 1, 1, 1, &logits, 1, llama_moe_prefetch_kick, 1, pl);
+    cb(kick, "moe_prefetch", il + 1);
+
+    ggml_build_forward_expand(gf, kick);
+
+    moe_prefetch[il + 1] = pl;
+}
+
+// the experts are about to be computed: stop prefetching, it would compete with the compute threads for memory bandwidth
+void llama_model_qwen35moe::graph::build_moe_post_routing(ggml_tensor * selected_experts, const int il) const {
+    if (il < 0 || il >= (int) moe_prefetch.size() || moe_prefetch[il] == nullptr) {
+        return;
+    }
+    ggml_tensor * cur = ggml_map_custom1(ctx0, selected_experts, llama_moe_prefetch_stop, 1, moe_prefetch[il]);
+    cb(cur, "moe_prefetch_stop", il);
+
+    ggml_build_forward_expand(gf, cur);
 }
 
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il) {

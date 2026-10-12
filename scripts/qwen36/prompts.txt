@@ -1,0 +1,15 @@
+Write a Python function that parses a CSV file of transactions (date, amount, category), groups the totals by month and category, and prints a formatted report. Include error handling and type hints.
+%%%
+Write a short story about a lighthouse keeper who discovers that the light has been signalling to something beneath the sea.
+%%%
+Explain step by step how to solve the equation 3x^2 - 12x + 9 = 0, then explain what the discriminant tells us about quadratic equations in general.
+%%%
+What were the main causes of the fall of the Western Roman Empire? Give a balanced overview of the economic, military and political factors.
+%%%
+Translate the following into French and German, then explain any idioms: "It's raining cats and dogs, so let's call it a day and hit the sack early."
+%%%
+I'm planning a 5-day trip to Japan in autumn on a moderate budget. Suggest an itinerary covering Tokyo and Kyoto, with food recommendations and transport tips.
+%%%
+Write a bash script that finds all files larger than 100MB in a directory tree, sorts them by size, and asks the user before deleting each one.
+%%%
+Compare TCP and UDP. When would you choose each one? Give concrete examples from real applications like games, video streaming and databases.

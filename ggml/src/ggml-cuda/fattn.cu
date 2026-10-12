@@ -285,6 +285,63 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 }
 
+// the MMA kernel can convert quantized K/V to f16 while loading, see DECL_FATTN_MMA_Q_CASE for the compiled cases
+static bool ggml_cuda_fattn_mma_q_supported(const int cc, const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (!turing_mma_available(cc) || !GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        return false;
+    }
+    if (K->type != GGML_TYPE_Q8_0 || (V->type != GGML_TYPE_Q8_0 && V->type != GGML_TYPE_Q4_0)) {
+        return false;
+    }
+    if (Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256) {
+        return false;
+    }
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+    // same conditions as the GQA optimization with ncols2 == 8
+    if (!mask || max_bias != 0.0f || K->ne[1] % FATTN_KQ_STRIDE != 0 || Q->ne[2] % K->ne[2] != 0 || (Q->ne[2] / K->ne[2]) % 8 != 0) {
+        return false;
+    }
+    for (const ggml_tensor * t : {Q, mask}) {
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                return false;
+            }
+        }
+    }
+    // the kernel uses K/V row strides in units of half2
+    for (const ggml_tensor * t : {K, V}) {
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % sizeof(half2) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+template <ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_mma_q_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+
+    if (Q->ne[1] <= 1) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8, type_K, type_V>(ctx, dst);
+    } else if (Q->ne[1] <= 2) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 2, 8, type_K, type_V>(ctx, dst);
+    } else if (Q->ne[1] <= 4) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 4, 8, type_K, type_V>(ctx, dst);
+    } else {
+        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 8, type_K, type_V>(ctx, dst);
+    }
+}
+
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -292,6 +349,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    if (ggml_cuda_fattn_mma_q_supported(cc, dst)) {
+        if (V->type == GGML_TYPE_Q8_0) {
+            ggml_cuda_flash_attn_ext_mma_q_switch_ncols1<GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_q_switch_ncols1<GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>(ctx, dst);
+        }
+        return;
+    }
 
     switch (Q->ne[0]) {
         case 64:
@@ -636,6 +702,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // reads the quantized K/V once for all heads of a GQA group, also for a single token
+        if (ggml_cuda_fattn_mma_q_supported(cc, dst)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
@@ -736,10 +806,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_MMA_F16: {
+            const bool convert_on_load = ggml_cuda_fattn_mma_q_supported(ggml_cuda_info().devices[device].cc, dst);
+            need_f16_K = !convert_on_load;
+            need_f16_V = !convert_on_load;
+        } break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;

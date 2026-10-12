@@ -2147,6 +2147,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    ggml_tensor * const inp = cur;
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -2281,6 +2283,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    build_moe_post_routing(selected_experts, il);
 
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
@@ -2438,6 +2442,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
     }
     cb(experts, "ffn_moe_down", il);
+
+    // add the nodes of the hook right after the experts, before the ops that may run on another backend
+    ggml_build_forward_expand(gf, experts);
+    build_moe_post_experts(inp, il);
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);

@@ -1698,7 +1698,9 @@ static void ggml_compute_forward_mul_mat_id(
         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
-        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
+        // an expert used by a few rows is memory bound: give each thread the same slice of the expert every time,
+        // so that the slice can be prefetched into the caches of that thread
+        if (nchunk0 * nchunk1 < nth * 4 || nr1 <= 4 || disable_chunking) {
             nchunk0 = nr0 > nr1 ? nth : 1;
             nchunk1 = nr0 > nr1 ? 1 : nth;
         }

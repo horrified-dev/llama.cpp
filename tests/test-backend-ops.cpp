@@ -11966,6 +11966,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // quantized K/V converted to f16 while loading in the CUDA MMA kernel
+    for (ggml_type type_V : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int64_t nb : { 1, 3, 8, 64 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, type_V));
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER

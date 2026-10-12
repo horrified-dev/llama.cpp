@@ -3274,6 +3274,23 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        uint32_t     kv_size  = cparams.n_ctx_seq;
+                        uint32_t     n_swa    = hparams.n_swa;
+                        llama_swa_type swa_type = hparams.swa_type;
+
+                        // the MTP head only drafts tokens, so it can attend to a window of recent tokens to save memory
+                        // the drafts are verified by the target, so this can lower the acceptance but not change the output
+                        if (arch == LLM_ARCH_QWEN35MOE && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                            const char * env = getenv("LLAMA_MTP_SWA");
+                            const uint32_t n_swa_mtp = env ? (uint32_t) std::max(0, atoi(env)) : 0;
+                            if (n_swa_mtp > 0 && n_swa_mtp + cparams.n_ubatch < kv_size) {
+                                n_swa    = n_swa_mtp;
+                                swa_type = LLAMA_SWA_TYPE_STANDARD;
+                                kv_size  = n_swa_mtp + cparams.n_ubatch;
+                                LLAMA_LOG_INFO("%s: MTP draft attends to the last %u tokens, KV size = %u\n", __func__, n_swa, kv_size);
+                            }
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -3282,11 +3299,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                kv_size,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                n_swa,
+                                swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,

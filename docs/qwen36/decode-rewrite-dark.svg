@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="302" viewBox="0 0 760 302" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
+<title id="t">Decode speed: rewriting existing code</title>
+<desc id="d">30.6, 40.3, 106.9, 108.3 tok/s.</desc>
+<rect width="760" height="302" rx="8" fill="#1a1a19"/>
+<text x="16.0" y="26.0" font-size="16" font-weight="600" fill="#f0efec" text-anchor="start" dominant-baseline="middle">Decode speed: rewriting existing code</text>
+<text x="16.0" y="47.0" font-size="12.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">The model re-emits a 1500-token file it was given, with one rename (a typical agentic edit)</text>
+<line x1="252.0" y1="68.0" x2="252.0" y2="228.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="252.0" y="242.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">0</text>
+<line x1="326.0" y1="68.0" x2="326.0" y2="228.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="326.0" y="242.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">20</text>
+<line x1="400.0" y1="68.0" x2="400.0" y2="228.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="400.0" y="242.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">40</text>
+<line x1="474.0" y1="68.0" x2="474.0" y2="228.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="474.0" y="242.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">60</text>
+<line x1="548.0" y1="68.0" x2="548.0" y2="228.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="548.0" y="242.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">80</text>
+<line x1="622.0" y1="68.0" x2="622.0" y2="228.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="622.0" y="242.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">100</text>
+<line x1="696.0" y1="68.0" x2="696.0" y2="228.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="696.0" y="242.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">120</text>
+<text x="474.0" y="262.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">tokens per second</text>
+<text x="240.0" y="88.0" font-size="12.5" font-weight="400" fill="#f0efec" text-anchor="end" dominant-baseline="middle">Stock llama.cpp, best flags</text>
+<path d="M252.0,79.0 H361.2 Q365.2,79.0 365.2,83.0 V93.0 Q365.2,97.0 361.2,97.0 H252.0 Z" fill="#3987e5"/>
+<text x="371.2" y="88.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">30.6</text>
+<text x="240.0" y="128.0" font-size="12.5" font-weight="400" fill="#f0efec" text-anchor="end" dominant-baseline="middle">+ MTP draft head (2 tokens)</text>
+<path d="M252.0,119.0 H397.1 Q401.1,119.0 401.1,123.0 V133.0 Q401.1,137.0 397.1,137.0 H252.0 Z" fill="#3987e5"/>
+<text x="407.1" y="128.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">40.3</text>
+<text x="240.0" y="168.0" font-size="12.5" font-weight="400" fill="#f0efec" text-anchor="end" dominant-baseline="middle">+ n-gram drafts</text>
+<path d="M252.0,159.0 H643.5 Q647.5,159.0 647.5,163.0 V173.0 Q647.5,177.0 643.5,177.0 H252.0 Z" fill="#3987e5"/>
+<text x="653.5" y="168.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">106.9</text>
+<text x="240.0" y="208.0" font-size="12.5" font-weight="400" fill="#f0efec" text-anchor="end" dominant-baseline="middle">+ expert prefetch (this fork)</text>
+<path d="M252.0,199.0 H648.7 Q652.7,199.0 652.7,203.0 V213.0 Q652.7,217.0 648.7,217.0 H252.0 Z" fill="#3987e5"/>
+<text x="658.7" y="208.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">108.3</text>
+<line x1="252.0" y1="68.0" x2="252.0" y2="228.0" stroke="#4a4a46" stroke-width="1"/>
+<text x="16.0" y="288.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="start" dominant-baseline="middle">n-gram drafts copy up to 30 tokens at a time from the context; 1443 of 1443 drafted tokens were accepted.</text>
+</svg>

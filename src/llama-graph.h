@@ -1206,6 +1206,19 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
+    // called by build_moe_ffn once the experts of a layer are selected, before they are computed
+    virtual void build_moe_post_routing(ggml_tensor * selected_experts, int il) const {
+        GGML_UNUSED(selected_experts);
+        GGML_UNUSED(il);
+    }
+
+    // called by build_moe_ffn once the experts of a layer are computed, before their outputs are combined
+    // inp is the input of the experts
+    virtual void build_moe_post_experts(ggml_tensor * inp, int il) const {
+        GGML_UNUSED(inp);
+        GGML_UNUSED(il);
+    }
+
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     ggml_tensor * build_moe_cache_slots(
              ggml_tensor * selected_experts,

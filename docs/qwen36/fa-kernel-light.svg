@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="436" viewBox="0 0 760 436" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
+<title id="t">Attention time per layer for one decoded token</title>
+<desc id="d">Stock: 273, 1027, 2034 us at 16K, 64K, 128K. This fork: 63, 202, 389 us.</desc>
+<rect width="760" height="436" rx="8" fill="#fcfcfb"/>
+<text x="16.0" y="26.0" font-size="16" font-weight="600" fill="#0b0b0b" text-anchor="start" dominant-baseline="middle">Attention time per layer for one decoded token</text>
+<text x="16.0" y="47.0" font-size="12.5" font-weight="400" fill="#52514e" text-anchor="start" dominant-baseline="middle">CUDA flash attention over a q8_0 K / q4_0 V cache, head size 256, RTX 3060</text>
+<line x1="14.0" y1="74.0" x2="34.0" y2="74.0" stroke="#9a9993" stroke-width="2"/>
+<circle cx="24.0" cy="74.0" r="5" fill="#9a9993" stroke="#fcfcfb" stroke-width="2"/>
+<text x="42.0" y="74.0" font-size="12.5" font-weight="400" fill="#52514e" text-anchor="start" dominant-baseline="middle">Stock (vector kernel)</text>
+<line x1="209.0" y1="74.0" x2="229.0" y2="74.0" stroke="#2a78d6" stroke-width="2"/>
+<circle cx="219.0" cy="74.0" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="237.0" y="74.0" font-size="12.5" font-weight="400" fill="#52514e" text-anchor="start" dominant-baseline="middle">This fork (tensor cores)</text>
+<line x1="64.0" y1="360.0" x2="610.0" y2="360.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="56.0" y="360.0" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="end" dominant-baseline="middle">0</text>
+<line x1="64.0" y1="311.2" x2="610.0" y2="311.2" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="311.2" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="end" dominant-baseline="middle">500</text>
+<line x1="64.0" y1="262.4" x2="610.0" y2="262.4" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="262.4" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="end" dominant-baseline="middle">1000</text>
+<line x1="64.0" y1="213.6" x2="610.0" y2="213.6" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="213.6" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="end" dominant-baseline="middle">1500</text>
+<line x1="64.0" y1="164.8" x2="610.0" y2="164.8" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="164.8" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="end" dominant-baseline="middle">2000</text>
+<line x1="64.0" y1="116.0" x2="610.0" y2="116.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="116.0" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="end" dominant-baseline="middle">2500</text>
+<text x="16.0" y="102.0" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="start" dominant-baseline="middle">µs per attention layer</text>
+<text x="84.2" y="376.0" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="middle" dominant-baseline="middle">16K</text>
+<text x="300.9" y="376.0" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="middle" dominant-baseline="middle">64K</text>
+<text x="589.8" y="376.0" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="middle" dominant-baseline="middle">128K</text>
+<polyline points="84.2,333.4 300.9,259.8 589.8,161.5" fill="none" stroke="#9a9993" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="84.2" cy="333.4" r="5" fill="#9a9993" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="300.9" cy="259.8" r="5" fill="#9a9993" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="589.8" cy="161.5" r="5" fill="#9a9993" stroke="#fcfcfb" stroke-width="2"/>
+<text x="601.8" y="161.5" font-size="12" font-weight="400" fill="#52514e" text-anchor="start" dominant-baseline="middle">Stock  2034 µs</text>
+<polyline points="84.2,353.9 300.9,340.3 589.8,322.0" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="84.2" cy="353.9" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="300.9" cy="340.3" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="589.8" cy="322.0" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="601.8" y="322.0" font-size="12" font-weight="400" fill="#52514e" text-anchor="start" dominant-baseline="middle">This fork  389 µs</text>
+<text x="16.0" y="400.0" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="start" dominant-baseline="middle">x-axis: tokens in the KV cache. 10 of the 40 layers are attention layers, so at 128K this saves</text>
+<text x="16.0" y="420.0" font-size="11" font-weight="400" fill="#6f6e69" text-anchor="start" dominant-baseline="middle">about 16 ms per token. Measured decode at 68K depth (262K profile): 29.0 -&gt; 33.4 tok/s.</text>
+</svg>
