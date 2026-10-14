@@ -58,6 +58,9 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // with GGML_SCHED_STREAM_WEIGHTS > 2, use the slots beyond 2 only while the device has memory to spare
+    void adapt_stream_slots();
+
     void synchronize();
 
     const llama_model   & get_model()   const;

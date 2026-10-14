@@ -8487,6 +8487,72 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+
+// flash attention with a positional causal mask (I32 positions instead of an F16 mask), see ggml_flash_attn_ext
+struct test_flash_attn_ext_pos : public test_case {
+    const int64_t kv;     // KV cells
+    const int64_t n_used; // cells in use, the rest are empty
+    const int64_t nb;     // queries, the last nb cells in use
+    const ggml_type type_V;
+    const int mode;       // 0: plain, 1: some empty cells in between, 2: the queries share a position with 2D (y, x) positions
+
+    std::string vars() override {
+        return VARS_TO_STR5(kv, n_used, nb, type_V, mode);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_pos(int64_t kv = 1024, int64_t n_used = 700, int64_t nb = 8, ggml_type type_V = GGML_TYPE_Q4_0, int mode = 0)
+        : kv(kv), n_used(n_used), nb(nb), type_V(type_V), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, nb, 16, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_Q8_0, 256, kv, 2, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_V, 256, kv, 2, 1);
+        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv + nb, 3);
+        ggml_set_name(m, "m");
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/16.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") != 0) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            const int64_t L = kv + nb;
+            std::vector<int32_t> pos(3*L, 0);
+            for (int64_t i = 0; i < kv; ++i) {
+                pos[i] = i < n_used ? int32_t(i) : -1;
+                if (mode == 1 && i < n_used - nb && i % 7 == 3) {
+                    pos[i] = -1;
+                }
+            }
+            for (int64_t j = 0; j < nb; ++j) {
+                const int64_t c = n_used - nb + j; // the cell of query j
+                pos[kv + j]         = int32_t(c);
+                pos[L + kv + j]     = INT32_MAX;
+                pos[2*L + kv + j]   = INT32_MAX;
+                if (mode == 2) {
+                    // an image: all its tokens have the same position, ordered by (y, x)
+                    pos[c]              = int32_t(n_used - nb);
+                    pos[L + c]          = int32_t(j / 8);
+                    pos[2*L + c]        = int32_t(j % 8);
+                    pos[kv + j]         = int32_t(n_used - nb);
+                    pos[L + kv + j]     = int32_t(j / 8);
+                    pos[2*L + kv + j]   = int32_t(j % 8);
+                }
+            }
+            ggml_backend_tensor_set(t, pos.data(), 0, pos.size()*sizeof(int32_t));
+        }
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -11970,6 +12036,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_V : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
         for (int64_t nb : { 1, 3, 8, 64 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, type_V));
+        }
+    }
+
+    // positional causal mask
+    for (ggml_type type_V : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int mode : {0, 1, 2}) {
+            for (int64_t nb : { 1, 3, 8, 64 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_pos(1024, 700, nb, type_V, mode));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_pos(2048, 1536, 1024, type_V, mode));
         }
     }
 

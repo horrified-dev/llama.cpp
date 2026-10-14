@@ -313,6 +313,16 @@ def main():
             1200, 200,
             "Real agentic turns (3.7K to 11K new tokens): 351-377 tok/s at 262K context, 563-617 tok/s at 128K.",
             fmt="{:.0f}", desc="487, 761, 1135 tok/s.")
+        hbar_chart(
+            "prefill-before-after", mode,
+            "Prefill speed: expert streaming and VRAM as you go",
+            "Huihui-Qwen3.6-35B-A3B Q8_0 + vision projector + MTP, 128K context, same prompts",
+            ["3.5K-token agentic turn", "11.2K-token agentic turn", "16.7K-token prompt", "112K-token prompt"],
+            [("Before (-ub 1024)", "gray", [538, 608, 613, 511]),
+             ("Now (-ub 2048, streaming)", "s1", [1085, 1128, 1309, 914])],
+            1400, 200,
+            "Before: this fork on 2026-10-13. Now: expert streaming, positional attention mask, growing KV cache.",
+            fmt="{:.0f}", desc="Before: 538, 608, 613, 511 tok/s. Now: 1085, 1128, 1309, 914 tok/s.")
         stacked_bar_chart(
             "step-breakdown", mode,
             "Where the time of one decode step goes",

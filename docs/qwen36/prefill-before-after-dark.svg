@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="410" viewBox="0 0 760 410" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
+<title id="t">Prefill speed: expert streaming and VRAM as you go</title>
+<desc id="d">Before: 538, 608, 613, 511 tok/s. Now: 1085, 1128, 1309, 914 tok/s.</desc>
+<rect width="760" height="410" rx="8" fill="#1a1a19"/>
+<text x="16.0" y="26.0" font-size="16" font-weight="600" fill="#f0efec" text-anchor="start" dominant-baseline="middle">Prefill speed: expert streaming and VRAM as you go</text>
+<text x="16.0" y="47.0" font-size="12.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">Huihui-Qwen3.6-35B-A3B Q8_0 + vision projector + MTP, 128K context, same prompts</text>
+<rect x="16.0" y="68.0" width="12" height="12" rx="3" fill="#7a7973"/>
+<text x="34.0" y="74.0" font-size="12.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">Before (-ub 1024)</text>
+<rect x="175.0" y="68.0" width="12" height="12" rx="3" fill="#3987e5"/>
+<text x="193.0" y="74.0" font-size="12.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">Now (-ub 2048, streaming)</text>
+<line x1="252.0" y1="96.0" x2="252.0" y2="336.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="252.0" y="350.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">0</text>
+<line x1="315.4" y1="96.0" x2="315.4" y2="336.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="315.4" y="350.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">200</text>
+<line x1="378.9" y1="96.0" x2="378.9" y2="336.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="378.9" y="350.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">400</text>
+<line x1="442.3" y1="96.0" x2="442.3" y2="336.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="442.3" y="350.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">600</text>
+<line x1="505.7" y1="96.0" x2="505.7" y2="336.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="505.7" y="350.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">800</text>
+<line x1="569.1" y1="96.0" x2="569.1" y2="336.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="569.1" y="350.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">1000</text>
+<line x1="632.6" y1="96.0" x2="632.6" y2="336.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="632.6" y="350.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">1200</text>
+<line x1="696.0" y1="96.0" x2="696.0" y2="336.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="696.0" y="350.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">1400</text>
+<text x="474.0" y="370.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="middle" dominant-baseline="middle">tokens per second</text>
+<text x="240.0" y="126.0" font-size="12.5" font-weight="400" fill="#f0efec" text-anchor="end" dominant-baseline="middle">3.5K-token agentic turn</text>
+<path d="M252.0,107.0 H418.6 Q422.6,107.0 422.6,111.0 V121.0 Q422.6,125.0 418.6,125.0 H252.0 Z" fill="#7a7973"/>
+<text x="428.6" y="116.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">538</text>
+<path d="M252.0,127.0 H592.1 Q596.1,127.0 596.1,131.0 V141.0 Q596.1,145.0 592.1,145.0 H252.0 Z" fill="#3987e5"/>
+<text x="602.1" y="136.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">1085</text>
+<text x="240.0" y="186.0" font-size="12.5" font-weight="400" fill="#f0efec" text-anchor="end" dominant-baseline="middle">11.2K-token agentic turn</text>
+<path d="M252.0,167.0 H440.8 Q444.8,167.0 444.8,171.0 V181.0 Q444.8,185.0 440.8,185.0 H252.0 Z" fill="#7a7973"/>
+<text x="450.8" y="176.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">608</text>
+<path d="M252.0,187.0 H605.7 Q609.7,187.0 609.7,191.0 V201.0 Q609.7,205.0 605.7,205.0 H252.0 Z" fill="#3987e5"/>
+<text x="615.7" y="196.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">1128</text>
+<text x="240.0" y="246.0" font-size="12.5" font-weight="400" fill="#f0efec" text-anchor="end" dominant-baseline="middle">16.7K-token prompt</text>
+<path d="M252.0,227.0 H442.4 Q446.4,227.0 446.4,231.0 V241.0 Q446.4,245.0 442.4,245.0 H252.0 Z" fill="#7a7973"/>
+<text x="452.4" y="236.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">613</text>
+<path d="M252.0,247.0 H663.1 Q667.1,247.0 667.1,251.0 V261.0 Q667.1,265.0 663.1,265.0 H252.0 Z" fill="#3987e5"/>
+<text x="673.1" y="256.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">1309</text>
+<text x="240.0" y="306.0" font-size="12.5" font-weight="400" fill="#f0efec" text-anchor="end" dominant-baseline="middle">112K-token prompt</text>
+<path d="M252.0,287.0 H410.1 Q414.1,287.0 414.1,291.0 V301.0 Q414.1,305.0 410.1,305.0 H252.0 Z" fill="#7a7973"/>
+<text x="420.1" y="296.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">511</text>
+<path d="M252.0,307.0 H537.9 Q541.9,307.0 541.9,311.0 V321.0 Q541.9,325.0 537.9,325.0 H252.0 Z" fill="#3987e5"/>
+<text x="547.9" y="316.0" font-size="11.5" font-weight="400" fill="#c3c2b7" text-anchor="start" dominant-baseline="middle">914</text>
+<line x1="252.0" y1="96.0" x2="252.0" y2="336.0" stroke="#4a4a46" stroke-width="1"/>
+<text x="16.0" y="396.0" font-size="11" font-weight="400" fill="#9a9993" text-anchor="start" dominant-baseline="middle">Before: this fork on 2026-10-13. Now: expert streaming, positional attention mask, growing KV cache.</text>
+</svg>

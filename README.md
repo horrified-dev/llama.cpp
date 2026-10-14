@@ -18,10 +18,13 @@ upstream llama.cpp; its README follows [further below](#llamacpp).
 | Decode, writing new code (default sampling) | 30.6 tok/s | **39.0 tok/s** (+27%) |
 | Decode, rewriting existing code | 30.6 tok/s | **108.3 tok/s** (3.5x) |
 | Attention per layer and token at 128K context | 2034 us | **389 us** (5.2x) |
-| Prefill, llama-bench pp2048 | 487 tok/s (`-ub 512`) | **761 tok/s** (`-ub 1024`) |
+| Prefill, 11.2K-token agentic turn | 608 tok/s (`-ub 1024`)* | **1128 tok/s** (expert streaming, `-ub 2048`) |
+| Prefill, 112K-token prompt | 511 tok/s* | **914 tok/s** |
 | Prefill, 64-token agentic turn | 0.49 s | **0.34 s** |
 | Context | 128K | **128K** (default profile) or **262,144** |
-| VRAM used | ~11.0 of 12 GB | 11.2-11.3 of 12 GB |
+| VRAM used | ~11.0 of 12 GB, from the start | **10.8 GB at start**, grows with the conversation to ~11.6 GB at 112K |
+
+\* prefill "before" is this fork as of 2026-10-13 with `-ub 1024`; stock llama.cpp at its default `-ub 512` is slower.
 
 "Stock, best flags" is upstream llama.cpp with the best settings found for this machine (`-ncmoe 33 -fa on -ctk q8_0
 -ctv q8_0 -lm dio -t 16`, 128K context) and no speculative decoding. Decode numbers are measured through `llama-server`
@@ -66,9 +69,25 @@ cores, which keeps decode fast deep into the context.
 
 ### Prefill
 
-With 33 of 40 layers' experts in system RAM, a large prompt is processed by streaming those experts over PCIe to
-the GPU, once per micro-batch. Bigger micro-batches amortize the transfer, so the 128K profile spends VRAM on
-`-ub 1024`.
+With 34 of 40 layers' experts in system RAM, a large prompt is processed by streaming those experts over PCIe to the
+GPU, once per micro-batch: about 1.1 s at 25.8 GB/s for each pass over the 34 layers. Profiling showed that the GPU
+used to alternate between uploading (63% of the time) and computing (30%), never both at once. The fork now uploads
+the experts of the next layers on a second CUDA stream while the current layer computes, and frees enough memory to
+afford micro-batches of 2048 tokens, which roughly doubles prefill speed (measured with Huihui-Qwen3.6-35B-A3B Q8_0,
+the vision projector and MTP loaded):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/qwen36/prefill-before-after-dark.svg">
+  <img alt="Prefill before vs now: 3.5K turn 538 vs 1085, 11.2K turn 608 vs 1128, 16.7K prompt 613 vs 1309, 112K prompt 511 vs 914 tok/s" src="docs/qwen36/prefill-before-after-light.svg">
+</picture>
+
+| Same prompts, same session | Before (`-ub 1024`) | Now (`-ub 2048`) |
+|---|---|---|
+| VRAM at start / peak at 112K context | 11.53 / 11.62 GB | **10.77 / 11.55 GB** |
+| Lowest free RAM during the runs | 442 MiB | **772 MiB** |
+| Output (greedy, top-5 probabilities) | | bit-identical |
+
+How the micro-batch size scales, before the streaming change:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/qwen36/prefill-ubatch-dark.svg">
@@ -87,10 +106,11 @@ CPU instead:
 
 Agentic multi-turn test (`scripts/qwen36/bench_multiturn.py`: two large tool outputs, then a short question):
 
-| Profile | Turn 1 (11.2K new tokens) | Turn 2 (3.7K new tokens) | Turn 3 |
+| Profile | Turn 1 (11.2K new tokens) | Turn 2 (3.5K new tokens) | Turn 3 |
 |---|---|---|---|
-| 128K, `-ub 1024` | 617 tok/s | 563 tok/s | ~25 new tokens, rest from cache |
-| 262K, `-ub 512` | 377 tok/s | 351 tok/s | ~25 new tokens, rest from cache |
+| 128K, `-ub 2048`, expert streaming | 1128 tok/s | 1085 tok/s | ~25 new tokens, rest from cache |
+| 128K, `-ub 1024` (before) | 608 tok/s | 538 tok/s | ~25 new tokens, rest from cache |
+| 262K, `-ub 512` (before) | 377 tok/s | 351 tok/s | ~25 new tokens, rest from cache |
 
 ## What this fork does differently
 
@@ -130,6 +150,25 @@ limit. A decode step with MTP (about 66 ms for 2-3 tokens) spends ~46 ms in the 
 5. **Static work split in the CPU `mul_mat_id` for batches of up to 4 tokens** (`ggml/src/ggml-cpu/ggml-cpu.c`). Each
    thread always processes the same rows of an expert, so the rows a prefetch helper loaded are used by the core next
    to it. This alone is ~4% faster for the 3-token batches of MTP verification.
+6. **Expert streaming** (`ggml/src/ggml-backend.cpp`, `GGML_SCHED_STREAM_WEIGHTS=<slots>`). The scheduler places the
+   device copies of host weights in a ring of slots instead of the compute buffer, and for batches of at least 512
+   tokens a second instance of the CUDA backend, with its own stream, uploads the experts of the next splits while the
+   current split computes. CUDA events order the uploads and the compute. Batches of 512+ tokens use almost every
+   expert anyway, so the whole expert tensor is uploaded without waiting for the router.
+7. **Positional causal mask** (`ggml/src/ggml.c`, `ggml/src/ggml-cuda/fattn*`, `ggml/src/ggml-cpu/ops.cpp`,
+   `LLAMA_FA_POS_MASK=1`). Flash attention normally reads an F16 mask of n_kv x n_batch, built on the CPU in pinned
+   memory, uploaded and kept in VRAM: 512 MiB each at 128K context and `-ub 2048`. With an I32 "mask" that holds the
+   positions of the KV cells and of the queries (and the 2D positions of image tokens), the quantized-KV MMA kernel
+   computes the mask itself, and the CPU implementation does the same for testing. This memory is what pays for the
+   bigger micro-batches.
+8. **VRAM as you go** (`src/llama-kv-cache.cpp`, `ggml/src/ggml-cuda/ggml-cuda.cu`, `LLAMA_KV_GROW=1`). The KV cache
+   reserves only CUDA virtual addresses at startup and maps zeroed device memory in 2 MiB pieces as the conversation
+   grows (and releases it when the cache is cleared). The tensors keep their addresses, so no kernel changes. If
+   another program takes the VRAM in between, a long conversation can run out of memory later; the request then fails
+   instead of the server.
+9. **Spare VRAM for speed** (`src/llama-context.cpp`). While the KV cache is small, a third streaming slot lets the
+   uploads run further ahead (+13% prefill); it is released when less than 512 MiB of VRAM is free. The MTP draft
+   context processes prompts in chunks of 512 tokens (`LLAMA_MTP_UBATCH`) to keep its compute buffers small.
 
 ### Configuration (upstream features, tuned for this machine)
 
@@ -173,6 +212,11 @@ scripts/qwen36/bench.sh
 | `LLAMA_MOE_PREFETCH_US=<us>` | upper bound for one prefetch, default 1000 |
 | `LLAMA_MOE_PREFETCH_MAX_TOKENS=<n>` | only prefetch for batches of up to `n` tokens, default 4 |
 | `LLAMA_MTP_SWA=<tokens>` | sliding window of the MTP draft head's KV cache |
+| `LLAMA_MTP_UBATCH=<n>` | micro-batch size of the MTP draft context (prompt processing), saves its compute buffers |
+| `GGML_SCHED_STREAM_WEIGHTS=<slots>` | stream host experts to the GPU on a second CUDA stream through `slots` slots (2-4, 3 recommended); more than 2 only while VRAM is spare |
+| `GGML_SCHED_STREAM_MIN_BATCH=<n>` | smallest batch that streams, default 512 |
+| `LLAMA_FA_POS_MASK=1` | positional causal mask instead of the F16 KQ mask (q8_0 K, q8_0/q4_0 V, one sequence) |
+| `LLAMA_KV_GROW=1` | the KV cache takes VRAM as the conversation grows |
 | `GGML_OP_OFFLOAD_MIN_BATCH=<n>` | (upstream) smallest batch for which CPU weights are streamed to the GPU |
 
 ---

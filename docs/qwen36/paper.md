@@ -467,6 +467,41 @@ with a 12 GB GPU, with up to 262K tokens of context. No single change achieves t
 placing them in the right tier, making each read serve more tokens, reading them while the hardware would idle, and
 not reading them twice.
 
+## 12. Addendum (2026-10-14): prompt processing at the PCIe limit
+
+Profiling one 1024-token micro-batch with CUDA events showed the GPU stream spending 63% of its time on expert uploads
+and 30% on compute, strictly one after the other, because the scheduler copies each host weight on the compute stream
+at the start of its split. Three changes, in the spirit of Section 1.1, roughly double prompt processing.
+
+**Overlap.** The scheduler now places the device copies of host weights in a ring of slots (272 MiB each, one expert
+tensor) instead of its compute buffer. For batches of at least 512 tokens, which use nearly every expert, a second
+instance of the CUDA backend uploads whole expert tensors on its own stream, up to one ring length ahead; CUDA events
+make each split wait for its upload and each upload wait until its slot is free. Two slots cost the same memory as
+before and hide most of the compute behind the transfers; a third slot (+13%) is used only while the device has more
+than 512 MiB free.
+
+**Read nothing twice, part two.** The F16 attention mask is n_kv x n_batch: 512 MiB at 128K context and 2048-token
+micro-batches, built by the CPU in pinned memory, uploaded, and kept on the GPU. Yet for one sequence it only encodes
+"cell i is visible to query j if pos(i) <= pos(j)" (plus a raster-order rule for the 2D positions of image tokens).
+Passing the positions instead, the quantized-KV MMA kernel computes each mask tile and the block-skipping pre-pass
+from them. The freed memory, on both the GPU and the host, pays for micro-batches of 2048 tokens.
+
+**VRAM as you go.** The KV cache reserves CUDA virtual addresses for the full context and maps zeroed device memory
+in 2 MiB pieces as cells are used, so the 1 GB of a 128K cache is spent only as the conversation grows; the extra
+streaming slot uses the headroom in the meantime.
+
+| Same prompts | Before (`-ub 1024`) | After (`-ub 2048`) |
+|---|---|---|
+| 3.5K-token turn | 538 tok/s | 1085 tok/s |
+| 11.2K-token turn | 608 tok/s | 1128 tok/s |
+| 16.7K-token prompt | 613 tok/s | 1309 tok/s |
+| 112K-token prompt | 511 tok/s | 914 tok/s |
+| VRAM at start / at 112K | 11.53 / 11.62 GB | 10.77 / 11.55 GB |
+
+Outputs are bit-identical (greedy text and top-5 probabilities), and decoding speed is unchanged. At shallow depth a
+pass is now close to its upload bound (34 layers x 855 MB at 25.8 GB/s, 1.13 s); deep into the context, the
+attention itself (about 4 x n_batch x n_kv x 256 x 16 FLOPs per layer) becomes the larger cost.
+
 ---
 
 ## References

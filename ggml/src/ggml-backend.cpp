@@ -908,6 +908,20 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_SPLIT_INPUTS 30
 #endif
 
+#ifndef GGML_SCHED_MAX_RING_SLOTS
+#define GGML_SCHED_MAX_RING_SLOTS 4
+#endif
+
+// a host weight whose device copy is placed in a ring of slots [GGML_SCHED_STREAM_WEIGHTS]
+struct ggml_backend_sched_ring_input {
+    int split_id;
+    int backend_id;
+    int k;       // ordinal among the ring inputs of the backend, the slot is k % ring_slots
+    bool stream; // uploaded ahead of time by the stream backend
+    struct ggml_tensor * input;
+    struct ggml_tensor * input_cpy;
+};
+
 #ifndef GGML_SCHED_MAX_COPIES
 #define GGML_SCHED_MAX_COPIES 4
 #endif
@@ -986,6 +1000,22 @@ struct ggml_backend_sched {
     int prev_graph_size;
 
     int debug_realloc;
+
+    // streaming of host weights [GGML_SCHED_STREAM_WEIGHTS=<slots>]
+    // the device copies of host weights that are used by a single split are placed in a ring of slots instead of the
+    // compute buffer; for batches of at least GGML_SCHED_STREAM_MIN_BATCH tokens, a second instance of the backend
+    // (with its own stream) uploads the weights of the next splits while the current split computes
+    int     ring_slots; // 0: disabled
+    int64_t stream_min_batch;
+    ggml_backend_buffer_t ring_buf      [GGML_SCHED_MAX_BACKENDS];
+    size_t                ring_slot_size[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_t        stream_backend[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_event_t  stream_ev_start [GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_event_t  stream_ev_upload[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_RING_SLOTS];
+    ggml_backend_event_t  stream_ev_free  [GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_RING_SLOTS];
+    struct ggml_backend_sched_ring_input * ring_inputs; // in split order
+    int n_ring_inputs;
+    int ring_inputs_capacity;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1211,6 +1241,186 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t);
+
+static bool ggml_backend_sched_stream_init(ggml_backend_sched_t sched, int b) {
+    if (sched->stream_backend[b] != NULL) {
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    if (!props.caps.async || !props.caps.events) {
+        return false;
+    }
+    ggml_backend_t sb = ggml_backend_dev_init(dev, NULL);
+    if (sb == NULL) {
+        return false;
+    }
+    sched->stream_ev_start[b] = ggml_backend_event_new(dev);
+    bool ok = sched->stream_ev_start[b] != NULL;
+    for (int s = 0; s < sched->ring_slots; s++) {
+        sched->stream_ev_upload[b][s] = ggml_backend_event_new(dev);
+        sched->stream_ev_free[b][s]   = ggml_backend_event_new(dev);
+        ok = ok && sched->stream_ev_upload[b][s] != NULL && sched->stream_ev_free[b][s] != NULL;
+    }
+    if (!ok) {
+        ggml_backend_free(sb);
+        return false;
+    }
+    sched->stream_backend[b] = sb;
+    return true;
+}
+
+// place the device copies of host weights that are used only by their own split in the ring of their backend
+static void ggml_backend_sched_ring_assign(ggml_backend_sched_t sched) {
+    sched->n_ring_inputs = 0;
+    if (sched->ring_slots == 0) {
+        return;
+    }
+
+    // copy -> split that uses it, -1 if it is also used by another split or the split has too many of them
+    std::unordered_map<const ggml_tensor *, int> copy_split;
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[split->backend_id]);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        int n = 0;
+        for (int j = 0; j < split->n_inputs; j++) {
+            if (ggml_backend_sched_is_host_weight(split->inputs[j])) {
+                n++;
+            }
+        }
+        for (int j = 0; j < split->n_inputs; j++) {
+            if (ggml_backend_sched_is_host_weight(split->inputs[j])) {
+                copy_split[tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy)] = n <= sched->ring_slots ? i : -1;
+            }
+        }
+    }
+    if (copy_split.empty()) {
+        return;
+    }
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int n = 0; n < split->graph.n_nodes; n++) {
+            const ggml_tensor * node = split->graph.nodes[n];
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                const ggml_tensor * src = node->src[s];
+                if (src == NULL) {
+                    continue;
+                }
+                auto it = copy_split.find(src->view_src ? src->view_src : src);
+                if (it != copy_split.end() && it->second != i) {
+                    it->second = -1;
+                }
+            }
+        }
+    }
+
+    // collect the ring inputs in split order, decide which backends stream
+    int    n_backend[GGML_SCHED_MAX_BACKENDS] = {0};
+    bool   all_large[GGML_SCHED_MAX_BACKENDS];
+    size_t slot_size[GGML_SCHED_MAX_BACKENDS] = {0};
+    for (int b = 0; b < sched->n_backends; b++) {
+        all_large[b] = true;
+    }
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->n_inputs; j++) {
+            struct ggml_tensor * input = split->inputs[j];
+            if (!ggml_backend_sched_is_host_weight(input)) {
+                continue;
+            }
+            struct ggml_tensor * cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+            auto it = copy_split.find(cpy);
+            if (it == copy_split.end() || it->second != i) {
+                continue;
+            }
+            // the batch size of the first node that uses the copy
+            int64_t batch = 0;
+            for (int n = 0; n < split->graph.n_nodes && batch == 0; n++) {
+                const ggml_tensor * node = split->graph.nodes[n];
+                if (node->src[0] == cpy) {
+                    batch = node->op == GGML_OP_MUL_MAT_ID ? node->ne[2] : node->ne[1];
+                }
+            }
+            if (batch < sched->stream_min_batch) {
+                all_large[split->backend_id] = false;
+            }
+            if (sched->n_ring_inputs >= sched->ring_inputs_capacity) {
+                sched->ring_inputs_capacity = std::max(64, 2*sched->ring_inputs_capacity);
+                sched->ring_inputs = (ggml_backend_sched_ring_input *) realloc(sched->ring_inputs,
+                    sched->ring_inputs_capacity*sizeof(ggml_backend_sched_ring_input));
+                GGML_ASSERT(sched->ring_inputs != NULL);
+            }
+            ggml_backend_sched_ring_input & ri = sched->ring_inputs[sched->n_ring_inputs++];
+            ri.split_id   = i;
+            ri.backend_id = split->backend_id;
+            ri.k          = n_backend[split->backend_id]++;
+            ri.stream     = false;
+            ri.input      = input;
+            ri.input_cpy  = cpy;
+            slot_size[split->backend_id] = std::max(slot_size[split->backend_id],
+                ggml_backend_buft_get_alloc_size(sched->bufts[split->backend_id], cpy));
+        }
+    }
+
+    // allocate or grow the rings
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (slot_size[b] == 0) {
+            continue;
+        }
+        const size_t ss = GGML_PAD(slot_size[b], ggml_backend_buft_get_alignment(sched->bufts[b]));
+        if (sched->ring_buf[b] == NULL || sched->ring_slot_size[b] < ss) {
+            // the old ring may still be in use
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+                if (sched->stream_backend[i] != NULL) {
+                    ggml_backend_synchronize(sched->stream_backend[i]);
+                }
+            }
+            ggml_backend_buffer_free(sched->ring_buf[b]);
+            sched->ring_buf[b] = ggml_backend_buft_alloc_buffer(sched->bufts[b], ss*sched->ring_slots);
+            sched->ring_slot_size[b] = 0;
+            if (sched->ring_buf[b] == NULL) {
+                GGML_LOG_ERROR("%s: failed to allocate the weight ring of %s, weights are copied through the compute buffer\n",
+                    __func__, ggml_backend_name(sched->backends[b]));
+                sched->ring_slots = 0;
+                sched->n_ring_inputs = 0;
+                return;
+            }
+            ggml_backend_buffer_set_usage(sched->ring_buf[b], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            ggml_backend_buffer_clear(sched->ring_buf[b], 0);
+            sched->ring_slot_size[b] = ss;
+            GGML_LOG_INFO("%s: %10s weight ring = %d slots x %8.2f MiB\n", __func__, ggml_backend_name(sched->backends[b]),
+                sched->ring_slots, ss/1024.0/1024.0);
+        }
+    }
+
+    for (int r = 0; r < sched->n_ring_inputs; r++) {
+        ggml_backend_sched_ring_input & ri = sched->ring_inputs[r];
+        const int b = ri.backend_id;
+        ri.stream = all_large[b] && ggml_backend_sched_stream_init(sched, b);
+        char * base = (char *) ggml_backend_buffer_get_base(sched->ring_buf[b]);
+        ggml_backend_tensor_alloc(sched->ring_buf[b], ri.input_cpy, base + (ri.k % sched->ring_slots)*sched->ring_slot_size[b]);
+    }
+}
+
+// upload the streamed ring input r on the stream backend, after the split that used the slot before is done
+static void ggml_backend_sched_stream_upload(ggml_backend_sched_t sched, int r) {
+    const ggml_backend_sched_ring_input & ri = sched->ring_inputs[r];
+    const int b    = ri.backend_id;
+    const int slot = ri.k % sched->ring_slots;
+    ggml_backend_t sb = sched->stream_backend[b];
+    if (ri.k >= sched->ring_slots) {
+        ggml_backend_event_wait(sb, sched->stream_ev_free[b][slot]);
+    }
+    ggml_backend_tensor_set_async(sb, ri.input_cpy, ri.input->data, 0, ggml_nbytes(ri.input));
+    ggml_backend_event_record(sched->stream_ev_upload[b][slot], sb);
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1750,6 +1960,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+
+    ggml_backend_sched_ring_assign(sched);
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1868,6 +2080,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // streamed ring inputs: the uploads may run ahead by up to ring_slots inputs of the same backend
+    int r_cur  = 0; // next ring input to consume
+    int r_next = 0; // next ring input to upload
+    int n_consumed[GGML_SCHED_MAX_BACKENDS] = {0};
+    {
+        bool started[GGML_SCHED_MAX_BACKENDS] = {false};
+        for (int r = 0; r < sched->n_ring_inputs; r++) {
+            const int b = sched->ring_inputs[r].backend_id;
+            if (sched->ring_inputs[r].stream && !started[b]) {
+                // the slots may still be in use by the previous graph
+                ggml_backend_event_record(sched->stream_ev_start[b], sched->backends[b]);
+                ggml_backend_event_wait(sched->stream_backend[b], sched->stream_ev_start[b]);
+                started[b] = true;
+            }
+        }
+    }
+    auto issue_uploads = [&]() {
+        while (r_next < sched->n_ring_inputs) {
+            const ggml_backend_sched_ring_input & ri = sched->ring_inputs[r_next];
+            if (ri.stream) {
+                if (ri.k >= n_consumed[ri.backend_id] + sched->ring_slots) {
+                    break;
+                }
+                ggml_backend_sched_stream_upload(sched, r_next);
+            }
+            r_next++;
+        }
+    };
+    issue_uploads();
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1890,9 +2132,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        issue_uploads();
+        const int r_split = r_cur;
+        while (r_cur < sched->n_ring_inputs && sched->ring_inputs[r_cur].split_id == split_id) {
+            r_cur++;
+        }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+            struct ggml_tensor * input = split->inputs[input_id];
+            if (!ggml_backend_sched_is_host_weight(input)) {
+                continue;
+            }
+            bool streamed = false;
+            for (int r = r_split; r < r_cur; r++) {
+                const ggml_backend_sched_ring_input & ri = sched->ring_inputs[r];
+                if (ri.input == input && ri.stream) {
+                    ggml_backend_event_wait(split_backend, sched->stream_ev_upload[ri.backend_id][ri.k % sched->ring_slots]);
+                    streamed = true;
+                }
+            }
+            if (!streamed) {
+                ggml_backend_sched_copy_input(sched, split, input);
             }
         }
 
@@ -1939,6 +2198,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
+
+        for (int r = r_split; r < r_cur; r++) {
+            const ggml_backend_sched_ring_input & ri = sched->ring_inputs[r];
+            if (ri.stream) {
+                ggml_backend_event_record(sched->stream_ev_free[ri.backend_id][ri.k % sched->ring_slots], split_backend);
+            }
+            n_consumed[ri.backend_id]++;
+        }
+        issue_uploads();
 
         prev_backend_id = split_backend_id;
     }
@@ -2013,6 +2281,16 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
+    {
+        const char * env = getenv("GGML_SCHED_STREAM_WEIGHTS");
+        sched->ring_slots = env ? std::min(std::max(atoi(env), 0), GGML_SCHED_MAX_RING_SLOTS) : 0;
+        if (sched->ring_slots == 1 || sched->n_copies > 1) {
+            sched->ring_slots = 0;
+        }
+        const char * env_batch = getenv("GGML_SCHED_STREAM_MIN_BATCH");
+        sched->stream_min_batch = env_batch ? atoll(env_batch) : 512;
+    }
+
     ggml_backend_sched_reset(sched);
 
     return sched;
@@ -2026,7 +2304,18 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
+        if (sched->stream_backend[b] != NULL) {
+            ggml_backend_synchronize(sched->stream_backend[b]);
+            ggml_backend_event_free(sched->stream_ev_start[b]);
+            for (int s = 0; s < GGML_SCHED_MAX_RING_SLOTS; s++) {
+                ggml_backend_event_free(sched->stream_ev_upload[b][s]);
+                ggml_backend_event_free(sched->stream_ev_free[b][s]);
+            }
+            ggml_backend_free(sched->stream_backend[b]);
+        }
+        ggml_backend_buffer_free(sched->ring_buf[b]);
     }
+    free(sched->ring_inputs);
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
@@ -2128,6 +2417,46 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     }
 
     return ggml_backend_sched_compute_splits(sched);
+}
+
+int ggml_backend_sched_get_stream_slots(ggml_backend_sched_t sched) {
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->stream_backend[b] != NULL) {
+            return sched->ring_slots;
+        }
+    }
+    return 0; // no weights were streamed so far
+}
+
+void ggml_backend_sched_set_stream_slots(ggml_backend_sched_t sched, int n_slots) {
+    n_slots = std::min(n_slots, GGML_SCHED_MAX_RING_SLOTS);
+    if (sched->ring_slots < 2 || n_slots < 2 || n_slots == sched->ring_slots) {
+        return;
+    }
+    // the rings are allocated again with the new number of slots when the next graph is split
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_synchronize(sched->backends[b]);
+        if (sched->stream_backend[b] != NULL) {
+            ggml_backend_synchronize(sched->stream_backend[b]);
+        }
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->stream_backend[b] != NULL) {
+            for (int s = sched->ring_slots; s < n_slots; s++) {
+                if (sched->stream_ev_upload[b][s] == NULL) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+                    sched->stream_ev_upload[b][s] = ggml_backend_event_new(dev);
+                    sched->stream_ev_free[b][s]   = ggml_backend_event_new(dev);
+                }
+            }
+        }
+        ggml_backend_buffer_free(sched->ring_buf[b]);
+        sched->ring_buf[b]       = NULL;
+        sched->ring_slot_size[b] = 0;
+    }
+    sched->ring_slots    = n_slots;
+    sched->n_ring_inputs = 0;
+    ggml_backend_sched_reset(sched);
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

@@ -2617,6 +2617,11 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
+    // the MTP head only needs the prompt for its KV cache: smaller ubatches save compute buffer memory [LLAMA_MTP_UBATCH]
+    if (spec_mtp && getenv("LLAMA_MTP_UBATCH")) {
+        cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, std::max(1, atoi(getenv("LLAMA_MTP_UBATCH"))));
+    }
+
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;

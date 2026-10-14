@@ -36,6 +36,14 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
+    // positions instead of a mask of n_kv x n_tokens, see ggml_flash_attn_ext
+    if (cparams.flash_attn && cparams.causal_attn && n_stream == 1 && ubatch.n_seqs_unq == 1 && mctx->use_pos_mask()) {
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv + n_tokens, 3);
+        ggml_set_input(res);
+        ggml_set_name(res, "attn_inp_kq_pos");
+        return res;
+    }
+
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
@@ -56,6 +64,13 @@ static bool can_reuse_kq_mask(
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     bool res = true;
+
+    if (kq_mask->type == GGML_TYPE_I32) {
+        res &= cparams.flash_attn && cparams.causal_attn && n_stream == 1 && ubatch.n_seqs_unq == 1 && mctx->use_pos_mask();
+        res &= (kq_mask->ne[0] == n_kv + n_tokens);
+        res &= (kq_mask->ne[1] == 3);
+        return res;
+    }
 
     res &= (kq_mask->ne[0] == n_kv);
     res &= (kq_mask->ne[1] == n_tokens/n_stream);

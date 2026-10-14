@@ -347,6 +347,11 @@ extern "C" {
 
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
+
+    // number of device slots for streamed host weights [GGML_SCHED_STREAM_WEIGHTS], 0 if disabled
+    GGML_API int                  ggml_backend_sched_get_stream_slots(ggml_backend_sched_t sched);
+    // change the number of slots (2 or more, if streaming is enabled), the graph has to be allocated again afterwards
+    GGML_API void                 ggml_backend_sched_set_stream_slots(ggml_backend_sched_t sched, int n_slots);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);

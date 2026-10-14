@@ -723,12 +723,41 @@ struct ggml_backend_cuda_buffer_context {
     void * dev_ptr = nullptr;
     std::string name;
 
+    // reserved buffer: dev_ptr is a range of virtual addresses, device memory is mapped on demand,
+    // see ggml_backend_cuda_buffer_type_alloc_reserved and ggml_backend_cuda_buffer_commit
+    size_t reserved    = 0; // size of the address range, 0 for a regular buffer
+    size_t granularity = 0;
+    std::vector<uint8_t> mapped;                    // per granule
+    std::vector<std::pair<size_t, size_t>> mappings; // [first granule, number of granules] of each mapping
+
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
+    void unmap_all() {
+#if defined(GGML_USE_VMM)
+        if (mappings.empty()) {
+            return;
+        }
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        for (const auto & [g0, n] : mappings) {
+            CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + g0*granularity, n*granularity));
+        }
+        mappings.clear();
+        std::fill(mapped.begin(), mapped.end(), 0);
+#endif // defined(GGML_USE_VMM)
+    }
+
     ~ggml_backend_cuda_buffer_context() {
+#if defined(GGML_USE_VMM)
+        if (reserved > 0) {
+            unmap_all();
+            CU_CHECK(cuMemAddressFree((CUdeviceptr) dev_ptr, reserved));
+            return;
+        }
+#endif // defined(GGML_USE_VMM)
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -755,7 +784,8 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         return GGML_STATUS_SUCCESS;
     }
 
-    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+    // in a reserved buffer, the memory is cleared when it is committed
+    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && ctx->reserved == 0) {
         // initialize padding to 0 to avoid possible NaN values
         const size_t original_size = ggml_nbytes(tensor);
         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
@@ -842,7 +872,14 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    if (ctx->reserved > 0) {
+        // only the mapped part of a reserved buffer
+        for (const auto & [g0, n] : ctx->mappings) {
+            CUDA_CHECK(cudaMemsetAsync((char *) ctx->dev_ptr + g0*ctx->granularity, value, n*ctx->granularity, cudaStreamPerThread));
+        }
+    } else {
+        CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -893,6 +930,118 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+}
+
+// a buffer of the CUDA buffer type that only reserves virtual addresses, device memory is mapped with
+// ggml_backend_cuda_buffer_commit as it is needed, nullptr if not supported
+static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_reserved(ggml_backend_buffer_type_t buft, size_t size) {
+#if defined(GGML_USE_VMM)
+    if (!ggml_backend_buft_is_cuda(buft)) {
+        return nullptr;
+    }
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
+    const int device = buft_ctx->device;
+    if (!ggml_cuda_info().devices[device].vmm || size == 0) {
+        return nullptr;
+    }
+    const size_t granularity = ggml_cuda_info().devices[device].vmm_granularity;
+    const size_t reserved    = granularity * ((size + granularity - 1) / granularity);
+
+    ggml_cuda_set_device(device);
+    CUdeviceptr ptr = 0;
+    if (cuMemAddressReserve(&ptr, reserved, 0, 0, 0) != CUDA_SUCCESS) {
+        return nullptr;
+    }
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) ptr);
+    ctx->reserved    = reserved;
+    ctx->granularity = granularity;
+    ctx->mapped.assign(reserved/granularity, 0);
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+#else
+    GGML_UNUSED_VARS(buft, size);
+    return nullptr;
+#endif // defined(GGML_USE_VMM)
+}
+
+// map zeroed device memory to [offset, offset + size) of a reserved buffer, false if out of memory
+static bool ggml_backend_cuda_buffer_commit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    if (ctx->reserved == 0 || size == 0) {
+        return true;
+    }
+#if defined(GGML_USE_VMM)
+    const size_t gran = ctx->granularity;
+    const size_t g_beg = offset / gran;
+    const size_t g_end = std::min(ctx->mapped.size(), (offset + size + gran - 1) / gran);
+
+    const int physical_device = ggml_cuda_get_physical_device(ctx->device);
+    ggml_cuda_set_device(ctx->device);
+
+    for (size_t g0 = g_beg; g0 < g_end; ) {
+        if (ctx->mapped[g0]) {
+            g0++;
+            continue;
+        }
+        size_t n = 1;
+        while (g0 + n < g_end && !ctx->mapped[g0 + n]) {
+            n++;
+        }
+
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = physical_device;
+        CUmemGenericAllocationHandle handle;
+        if (cuMemCreate(&handle, n*gran, &prop, 0) != CUDA_SUCCESS) {
+            GGML_LOG_ERROR("%s: out of device memory: cannot commit %.2f MiB on device %d\n", __func__, n*gran/1024.0/1024.0, ctx->device);
+            return false;
+        }
+        const CUdeviceptr ptr = (CUdeviceptr) ctx->dev_ptr + g0*gran;
+        CU_CHECK(cuMemMap(ptr, n*gran, 0, handle, 0));
+        CU_CHECK(cuMemRelease(handle)); // the memory is freed when it is unmapped
+
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = physical_device;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        CU_CHECK(cuMemSetAccess(ptr, n*gran, &access, 1));
+
+        CUDA_CHECK(cudaMemsetAsync((void *) ptr, 0, n*gran, cudaStreamPerThread));
+
+        for (size_t g = g0; g < g0 + n; ++g) {
+            ctx->mapped[g] = 1;
+        }
+        ctx->mappings.push_back({g0, n});
+        g0 += n;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    return true;
+#else
+    GGML_UNUSED_VARS(offset, size);
+    return false;
+#endif // defined(GGML_USE_VMM)
+}
+
+// release all device memory of a reserved buffer, the contents are lost
+static void ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    if (ctx->reserved > 0) {
+        ctx->unmap_all();
+    }
+}
+
+// device memory mapped to a reserved buffer, the size of a regular buffer
+static size_t ggml_backend_cuda_buffer_committed_size(ggml_backend_buffer_t buffer) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    if (ctx->reserved == 0) {
+        return buffer->size;
+    }
+    size_t n = 0;
+    for (const auto & m : ctx->mappings) {
+        n += m.second;
+    }
+    return n*ctx->granularity;
 }
 
 static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -2527,6 +2676,7 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete cuda_ctx;
     delete backend;
 }
+
 
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -6013,6 +6163,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_buffer_type_alloc_reserved") == 0) {
+        return (void *)ggml_backend_cuda_buffer_type_alloc_reserved;
+    }
+    if (strcmp(name, "ggml_backend_buffer_commit") == 0) {
+        return (void *)ggml_backend_cuda_buffer_commit;
+    }
+    if (strcmp(name, "ggml_backend_buffer_decommit") == 0) {
+        return (void *)ggml_backend_cuda_buffer_decommit;
+    }
+    if (strcmp(name, "ggml_backend_buffer_committed_size") == 0) {
+        return (void *)ggml_backend_cuda_buffer_committed_size;
     }
     return nullptr;
 }

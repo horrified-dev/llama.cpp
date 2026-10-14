@@ -5,6 +5,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "ggml-alloc.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -282,7 +284,48 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            buf = nullptr;
+            // reserve the addresses only, the memory is committed as the cache fills up [LLAMA_KV_GROW]
+            static const bool grow = getenv("LLAMA_KV_GROW") && atoi(getenv("LLAMA_KV_GROW")) != 0;
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (grow && reg) {
+                auto fn_alloc = (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_type_alloc_reserved");
+                fn_commit   = (bool (*)(ggml_backend_buffer_t, size_t, size_t))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit");
+                fn_decommit = (void (*)(ggml_backend_buffer_t))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_decommit");
+                if (fn_alloc && fn_commit && fn_decommit) {
+                    // same layout as ggml_backend_alloc_ctx_tensors_from_buft
+                    const size_t align = ggml_backend_buft_get_alignment(buft);
+                    size_t size = 0;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                        if (t->data == nullptr && t->view_src == nullptr) {
+                            size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+                        }
+                    }
+                    buf = fn_alloc(buft, size);
+                    if (buf) {
+                        ggml_tallocr talloc = ggml_tallocr_new(buf);
+                        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                            if (t->data == nullptr && t->view_src == nullptr && ggml_tallocr_alloc(&talloc, t) != GGML_STATUS_SUCCESS) {
+                                throw std::runtime_error("failed to place a tensor in the kv cache buffer");
+                            }
+                        }
+                        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                            if (t->view_src != nullptr && t->buffer == nullptr) {
+                                ggml_backend_view_init(t);
+                            }
+                        }
+                        grow_bufs.push_back(buf);
+                        LLAMA_LOG_INFO("%s: %10s KV buffer: device memory is committed as the cache fills up\n", __func__, ggml_backend_buffer_name(buf));
+                    }
+                }
+            }
+            if (!buf) {
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            }
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -392,9 +435,49 @@ void llama_kv_cache::clear(bool data) {
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
+            if (std::find(grow_bufs.begin(), grow_bufs.end(), buf.get()) != grow_bufs.end()) {
+                fn_decommit(buf.get()); // give the memory back, it is cleared again when it is committed
+                continue;
+            }
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+        if (!grow_bufs.empty()) {
+            n_committed = 0;
+        }
     }
+}
+
+bool llama_kv_cache::commit_cells(uint32_t n) {
+    if (grow_bufs.empty() || n <= n_committed) {
+        return true;
+    }
+    // commit in steps of 4096 cells to keep the number of mappings low
+    n = std::min(get_size(), GGML_PAD(n, 4096u));
+
+    for (const auto & layer : layers) {
+        for (ggml_tensor * t : { layer.k, layer.v }) {
+            if (t == nullptr || std::find(grow_bufs.begin(), grow_bufs.end(), t->buffer) == grow_bufs.end()) {
+                continue;
+            }
+            const size_t offset = (const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer);
+            bool ok = true;
+            if (t == layer.v && v_trans) {
+                // the cells are the columns of a transposed V
+                ok = fn_commit(t->buffer, offset, ggml_nbytes(t));
+            } else {
+                // [n_embd, kv_size, n_stream]
+                for (int64_t s = 0; s < t->ne[2] && ok; ++s) {
+                    ok = fn_commit(t->buffer, offset + s*t->nb[2], n*t->nb[1]);
+                }
+            }
+            if (!ok) {
+                LLAMA_LOG_ERROR("%s: failed to commit device memory for %u cells of the kv cache\n", __func__, n);
+                return false;
+            }
+        }
+    }
+    n_committed = n;
+    return true;
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -871,6 +954,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     }
 
     if (do_shift) {
+        if (!commit_cells(get_size())) {
+            LLAMA_LOG_ERROR("%s: not enough device memory to shift the kv cache\n", __func__);
+            return false;
+        }
         if (!get_can_shift()) {
             GGML_ABORT("The current KV cache / model configuration does not support K-shift");
         }
@@ -1244,6 +1331,18 @@ ggml_type llama_kv_cache::type_k() const {
 
 ggml_type llama_kv_cache::type_v() const {
     return layers[0].v->type;
+}
+
+bool llama_kv_cache::use_pos_mask() const {
+    static const bool enabled = getenv("LLAMA_FA_POS_MASK") && atoi(getenv("LLAMA_FA_POS_MASK")) != 0;
+    if (!enabled || layers.empty() || swa_type != LLAMA_SWA_TYPE_NONE || n_stream != 1 || v_trans) {
+        return false;
+    }
+    // the CUDA MMA kernel for quantized K/V, see ggml_cuda_fattn_mma_q_supported
+    const uint32_t il = layers[0].il;
+    return type_k() == GGML_TYPE_Q8_0 && (type_v() == GGML_TYPE_Q8_0 || type_v() == GGML_TYPE_Q4_0) &&
+        hparams.n_embd_head_k(il) == 256 && hparams.n_embd_head_v(il) == 256 &&
+        hparams.n_head(il) % hparams.n_head_kv(il) == 0 && (hparams.n_head(il) / hparams.n_head_kv(il)) % 8 == 0;
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
@@ -1754,7 +1853,51 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+void llama_kv_cache::set_input_kq_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[1] == 3);
+
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t L        = dst->ne[0];
+    const int64_t n_kv     = L - n_tokens;
+
+    const llama_seq_id seq_id = ubatch->seq_id[0][0];
+    const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+    const bool is_2d = ubatch->is_pos_2d();
+
+    int32_t * pos   = (int32_t *) dst->data;
+    int32_t * pos_y = pos + L;
+    int32_t * pos_x = pos + 2*L;
+
+    for (int64_t j = 0; j < n_kv; ++j) {
+        pos_y[j] = 0;
+        pos_x[j] = 0;
+        if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
+            pos[j] = -1;
+            continue;
+        }
+        pos[j] = cells.pos_get(j);
+        if (is_2d) {
+            const auto & ext = cells.ext_get(j);
+            pos_y[j] = ext.y;
+            pos_x[j] = ext.x;
+        }
+    }
+    // the 2D positions of the queries only matter for M-RoPE batches, INT32_MAX disables the 2D rule
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        GGML_ASSERT(ubatch->seq_id[i][0] == seq_id);
+        pos  [n_kv + i] = ubatch->pos[i];
+        pos_y[n_kv + i] = is_2d ? ubatch->pos[i + n_tokens]   : INT32_MAX;
+        pos_x[n_kv + i] = is_2d ? ubatch->pos[i + 2*n_tokens] : INT32_MAX;
+    }
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (dst->type == GGML_TYPE_I32) {
+        set_input_kq_pos(dst, ubatch);
+        return;
+    }
+
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -2864,6 +3007,11 @@ bool llama_kv_cache_context::apply() {
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
+    // the graph reads the first n_kv cells
+    if (!kv->commit_cells(n_kv)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -2887,6 +3035,10 @@ ggml_type llama_kv_cache_context::type_k() const {
 
 ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
+}
+
+bool llama_kv_cache_context::use_pos_mask() const {
+    return kv->use_pos_mask();
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {

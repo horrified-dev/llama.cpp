@@ -309,7 +309,7 @@ static bool ggml_cuda_fattn_mma_q_supported(const int cc, const ggml_tensor * ds
     if (!mask || max_bias != 0.0f || K->ne[1] % FATTN_KQ_STRIDE != 0 || Q->ne[2] % K->ne[2] != 0 || (Q->ne[2] / K->ne[2]) % 8 != 0) {
         return false;
     }
-    for (const ggml_tensor * t : {Q, mask}) {
+    for (const ggml_tensor * t : {Q, mask->type == GGML_TYPE_I32 ? Q : mask}) {
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
             if (t->nb[i] % 16 != 0) {
                 return false;
@@ -615,6 +615,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+
+    // the positional mask is only supported by the MMA kernel for quantized K/V
+    if (mask && mask->type == GGML_TYPE_I32) {
+        return ggml_cuda_fattn_mma_q_supported(ggml_cuda_info().devices[device].cc, dst) ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+    }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);

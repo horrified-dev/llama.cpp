@@ -566,6 +566,45 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const int stride_mask, const int k_VKQ_0, const int i_sup, const int j0, const uint3 ne01,
         const int32_t * const __restrict__ indices) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    if constexpr (!use_cp_async && !use_sparse) {
+        if (stride_mask < 0) {
+            // positional mask (see ggml_flash_attn_ext): mask_h holds the positions, the row stride is -n_kv
+            const int32_t * pos = (const int32_t *) mask_h;
+            const int n_kv = -stride_mask;
+            const int L    = n_kv + ne01.z;
+#pragma unroll
+            for (int j1 = 0; j1 < ncols1; j1 += nwarps) {
+                const int j_sram = j1 + threadIdx.y;
+                const int j_vram = fastmodulo(j0 + j_sram, ne01);
+
+                if (j1 + nwarps > ncols1 && j_sram >= ncols1) {
+                    break;
+                }
+
+                const int qp = pos[n_kv + j_vram];
+                const int qy = pos[L + n_kv + j_vram];
+                const int qx = pos[2*L + n_kv + j_vram];
+
+#pragma unroll
+                for (int i0 = 0; i0 < nbatch_fa; i0 += warp_size) {
+                    const int i = i0 + threadIdx.x;
+                    half val = half(0.0f);
+                    if (!oob_check || i < i_sup) {
+                        const int c  = k_VKQ_0 + i;
+                        const int kp = pos[c];
+                        bool keep = kp >= 0 && kp <= qp;
+                        if (keep && kp == qp) {
+                            const int ky = pos[L + c];
+                            keep = !(ky > qy || (ky == qy && pos[2*L + c] > qx));
+                        }
+                        val = keep ? half(0.0f) : half(-INFINITY);
+                    }
+                    tile_mask[j_sram*(nbatch_fa + 8) + i] = val;
+                }
+            }
+            return;
+        }
+    }
     if constexpr (use_cp_async) {
         static_assert(nbatch_fa <= 8*warp_size && nbatch_fa % 8 == 0, "bad nbatch_fa");
         static_assert(!oob_check, "OOB check incompatible with cp_async");
@@ -1977,7 +2016,7 @@ static __global__ void flash_attn_ext_f16(
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
     const int stride_K    = nb11 / sizeof(half2);
-    const int stride_mask = nb31 / sizeof(half);
+    const int stride_mask = nb31 / int(sizeof(half)); // negative for the positional mask
 
     const int stride_V = V_is_K_view ? stride_K : nb21 / sizeof(half2);
 

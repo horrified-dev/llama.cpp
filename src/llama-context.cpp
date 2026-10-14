@@ -1500,7 +1500,47 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+void llama_context::adapt_stream_slots() {
+    static const int slots_max = getenv("GGML_SCHED_STREAM_WEIGHTS") ? atoi(getenv("GGML_SCHED_STREAM_WEIGHTS")) : 0;
+    if (slots_max <= 2 || !sched) {
+        return;
+    }
+    const int slots = ggml_backend_sched_get_stream_slots(sched.get());
+    if (slots < 2) {
+        return;
+    }
+    ggml_backend_dev_t dev = nullptr;
+    for (auto * backend : backend_ptrs) {
+        ggml_backend_dev_t d = ggml_backend_get_device(backend);
+        if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            dev = d;
+            break;
+        }
+    }
+    if (dev == nullptr) {
+        return;
+    }
+    // the extra slots go first when the memory gets low, e.g. because the KV cache grows [LLAMA_KV_GROW]
+    const size_t MiB = 1024*1024;
+    size_t free = 0;
+    size_t total = 0;
+    ggml_backend_dev_memory(dev, &free, &total);
+    int want = slots;
+    if (free < 512*MiB) {
+        want = 2;
+    } else if (free > 1024*MiB) {
+        want = slots_max;
+    }
+    if (want != slots) {
+        LLAMA_LOG_INFO("%s: %zu MiB free on %s, using %d slots for streamed weights\n", __func__, free/MiB, ggml_backend_dev_name(dev), want);
+        ggml_backend_sched_set_stream_slots(sched.get(), want);
+        gf_res_prev_active = nullptr; // the graph has to be allocated again
+    }
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    adapt_stream_slots();
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;

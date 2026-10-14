@@ -726,6 +726,53 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+// like flash_attn_mask_to_KV_max for the positional mask (see ggml_flash_attn_ext), conservative for M-RoPE
+template <int ncols1>
+__launch_bounds__(FATTN_KQ_STRIDE, 1)
+static __global__ void flash_attn_pos_to_KV_max(
+        const int32_t * __restrict__ pos, int * __restrict__ KV_max, const int ne30, const int n_kv, const int n_q) {
+    const int ne31 = gridDim.x;
+    const int tid  = threadIdx.x;
+    const int jt   = blockIdx.x;
+
+    int q_max = -1;
+#pragma unroll
+    for (int j = 0; j < ncols1; ++j) {
+        if (jt*ncols1 + j < n_q) {
+            q_max = max(q_max, pos[n_kv + jt*ncols1 + j]);
+        }
+    }
+
+    __shared__ int buf_any[FATTN_KQ_STRIDE/WARP_SIZE];
+    ggml_cuda_pdl_sync();
+
+    int KV_max_sj = (ne30 - 1) * FATTN_KQ_STRIDE;
+    for (; KV_max_sj >= 0; KV_max_sj -= FATTN_KQ_STRIDE) {
+        const int kp = pos[KV_max_sj + tid];
+        int any = warp_reduce_any(int(kp >= 0 && kp <= q_max));
+        if (tid % WARP_SIZE == 0) {
+            buf_any[tid / WARP_SIZE] = any;
+        }
+        __syncthreads();
+        any = 0;
+#pragma unroll
+        for (int w = 0; w < FATTN_KQ_STRIDE/WARP_SIZE; ++w) {
+            any |= buf_any[w];
+        }
+        __syncthreads();
+        if (any) {
+            break;
+        }
+    }
+    KV_max_sj += FATTN_KQ_STRIDE;
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+    KV_max[jt] = KV_max_sj;
+    GGML_UNUSED(ne31);
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1003,7 +1050,9 @@ void launch_fattn(
     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
-    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
+    // positional mask: the kernel gets a negative mask row stride, -n_kv, see flash_attn_ext_f16_load_mask
+    const bool pos_mask = mask && mask->type == GGML_TYPE_I32;
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1115,7 +1164,15 @@ void launch_fattn(
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
     const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
-    if (scan_mask) {
+    if (scan_mask && pos_mask) {
+        const dim3 blocks_num_KV_max(ntiles_x, 1, 1);
+        const dim3 block_dim_KV_max(FATTN_KQ_STRIDE, 1, 1);
+        KV_max.alloc(ntiles_x);
+        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_pos_to_KV_max<ncols1>, launch_params,
+            (const int32_t *) mask->data, KV_max.ptr, int(K->ne[1] / FATTN_KQ_STRIDE), int(K->ne[1]), int(Q->ne[1]));
+        CUDA_CHECK(cudaGetLastError());
+    } else if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1260,8 +1317,8 @@ void launch_fattn(
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        pos_mask ? 1 : mask ? mask->ne[1] : 0, pos_mask ? 1 : mask ? mask->ne[2] : 0, pos_mask ? 1 : mask ? mask->ne[3] : 0,
+        pos_mask ? -int32_t(K->ne[1]*sizeof(half)) : mask ? mask->nb[1] : 0, pos_mask ? 0 : mask ? mask->nb[2] : 0, pos_mask ? 0 : mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
 

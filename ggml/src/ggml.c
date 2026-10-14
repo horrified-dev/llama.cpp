@@ -5519,7 +5519,15 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == k->ne[3]);
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
-    if (mask) {
+    if (mask && mask->type == GGML_TYPE_I32) {
+        // positional causal mask, a single sequence: row 0 holds the positions of the KV cells (-1: masked) followed by
+        // the positions of the queries, rows 1 and 2 hold the y and x positions for M-RoPE (the queries' are INT32_MAX if unused)
+        // KV cell i is visible to query j if pos[i] >= 0 && (pos[i] < qpos[j] || (pos[i] == qpos[j] && !(y,x)[i] > (y,x)[j]))
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(mask->ne[0] == k->ne[1] + q->ne[1] && mask->ne[1] == 3 && mask->ne[2] == 1 && mask->ne[3] == 1);
+        GGML_ASSERT(q->ne[3] == 1);
+        GGML_ASSERT(max_bias == 0.0f);
+    } else if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
         GGML_ASSERT(ggml_is_contiguous(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));

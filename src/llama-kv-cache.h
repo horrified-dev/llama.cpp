@@ -164,6 +164,13 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // the attention can use a positional mask instead of an F16 mask (LLAMA_FA_POS_MASK=1), see ggml_flash_attn_ext
+    bool use_pos_mask() const;
+
+    // with LLAMA_KV_GROW=1, the device memory of the cells is committed as the cache fills up
+    // make sure that the first n cells of each stream are backed by memory, false if out of memory
+    bool commit_cells(uint32_t n);
+
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
@@ -233,6 +240,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
+    void set_input_kq_pos    (ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
@@ -267,6 +275,12 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // buffers that only reserve addresses, their memory is committed by commit_cells [LLAMA_KV_GROW]
+    std::vector<ggml_backend_buffer_t> grow_bufs;
+    uint32_t n_committed = 0; // cells per stream backed by memory
+    bool (*fn_commit)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
+    void (*fn_decommit)(ggml_backend_buffer_t)               = nullptr;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -402,6 +416,8 @@ public:
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+
+    bool use_pos_mask() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;

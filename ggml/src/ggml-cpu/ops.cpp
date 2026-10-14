@@ -8946,7 +8946,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
-        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        // positional mask, see ggml_flash_attn_ext
+        const int32_t * pm = mask && mask->type == GGML_TYPE_I32 ? (const int32_t *) mask->data : NULL;
+        const int64_t   pm_L = pm ? mask->ne[0] : 0;
+        const int32_t   pm_qp = pm ? pm[nek1 + iq1]          : 0;
+        const int32_t   pm_qy = pm ? pm[pm_L + nek1 + iq1]   : 0;
+        const int32_t   pm_qx = pm ? pm[2*pm_L + nek1 + iq1] : 0;
+
+        const ggml_fp16_t * mp = mask && !pm ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8964,7 +8971,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            if (pm) {
+                const int32_t kp = pm[ic];
+                const int32_t ky = pm[pm_L + ic];
+                const int32_t kx = pm[2*pm_L + ic];
+                const bool keep = kp >= 0 && (kp < pm_qp || (kp == pm_qp && !(ky > pm_qy || (ky == pm_qy && kx > pm_qx))));
+                mv = keep ? 0.0f : -INFINITY;
+            }
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9486,7 +9500,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool pos_mask = dst->src[3] && dst->src[3]->type == GGML_TYPE_I32; // only the reference path supports it
+    const bool use_split_kv_path = !use_ref && !pos_mask && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9543,7 +9558,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !pos_mask &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
