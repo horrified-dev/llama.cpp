@@ -1643,6 +1643,11 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
+    // expert range [ggml_mul_mat_id_set_range]
+    const int32_t id_lo  = ggml_get_op_params_i32(dst, 0);
+    const int32_t id_hi  = ggml_get_op_params_i32(dst, 1);
+    const bool    ranged = id_hi > id_lo;
+
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
@@ -1650,7 +1655,14 @@ static void ggml_compute_forward_mul_mat_id(
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+
+                if (ranged) {
+                    if (i02 < id_lo || i02 >= id_hi) {
+                        continue;
+                    }
+                    i02 -= id_lo;
+                }
 
                 assert(i02 >= 0 && i02 < n_as);
 
@@ -1664,6 +1676,18 @@ static void ggml_compute_forward_mul_mat_id(
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
         *current_chunk_ctr = nth;
+    }
+
+    // the rows of the experts outside of the range are 0
+    if (ranged && ggml_get_op_params_i32(dst, 2)) {
+        for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                if (i02 < id_lo || i02 >= id_hi) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                }
+            }
+        }
     }
 
     ggml_barrier(params->threadpool);

@@ -165,6 +165,11 @@ struct clip_ctx {
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
 
+    // weights of a device backend that are read from the file with the first image [LLAMA_MMPROJ_LAZY=1]
+    bool lazy_pending = false;
+    std::string lazy_fname;
+    std::vector<std::pair<std::string, size_t>> lazy_tensors; // name, file offset
+
     bool debug_output_embeddings = false;
 
     // for measuring memory usage
@@ -3726,6 +3731,21 @@ struct clip_model_loader {
 
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+
+            // device memory is taken when the first image arrives [LLAMA_MMPROJ_LAZY=1]
+            static const bool lazy = getenv("LLAMA_MMPROJ_LAZY") && atoi(getenv("LLAMA_MMPROJ_LAZY")) != 0;
+            if (lazy && !ctx_clip.no_alloc && !ggml_backend_buft_is_host(buft)) {
+                ctx_clip.lazy_fname = fname;
+                for (auto & t : tensors_to_load) {
+                    ctx_clip.lazy_tensors.push_back({t->name, tensor_offset.at(t->name)});
+                }
+                ctx_clip.lazy_pending = true;
+                LOG_INF("%s: %.2f MiB of weights are loaded to %s with the first input\n", __func__,
+                    total_data_size/1024.0/1024.0, ggml_backend_buft_name(buft));
+                fin.close();
+                return;
+            }
+
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
@@ -4099,7 +4119,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
-            if (ctx_params.warmup) {
+            if (ctx_params.warmup && !ctx_vision->lazy_pending) {
                 loader.warmup(*ctx_vision);
             }
 
@@ -4113,7 +4133,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);
             loader.load_tensors(*ctx_audio);
             loader.init_ctx(*ctx_audio);
-            if (ctx_params.warmup) {
+            if (ctx_params.warmup && !ctx_audio->lazy_pending) {
                 loader.warmup(*ctx_audio);
             }
         }
@@ -4145,6 +4165,18 @@ struct clip_cap clip_get_cap(const char * fname) {
     res.has_vision = loader.has_vision;
     res.has_audio  = loader.has_audio;
     return res;
+}
+
+size_t clip_get_pending_device_bytes(const clip_ctx * ctx) {
+    if (ctx == nullptr || !ctx->lazy_pending) {
+        return 0;
+    }
+    size_t n = 256u*1024*1024; // compute buffer
+    for (const auto & [name, offset] : ctx->lazy_tensors) {
+        const ggml_tensor * t = ggml_get_tensor(ctx->ctx_data.get(), name.c_str());
+        n += t ? ggml_nbytes(t) : 0;
+    }
+    return n;
 }
 
 int clip_get_image_max_tokens(const clip_ctx * ctx) {
@@ -4569,7 +4601,44 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
     }
 }
 
+// read the weights that were deferred by LLAMA_MMPROJ_LAZY
+static bool clip_load_lazy_weights(clip_ctx * ctx) {
+    if (!ctx->lazy_pending) {
+        return true;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx->backend);
+    ctx->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx->ctx_data.get(), buft));
+    if (!ctx->buf) {
+        LOG_ERR("%s: not enough memory on %s for the weights of the multimodal projector\n", __func__, ggml_backend_buft_name(buft));
+        return false;
+    }
+    ggml_backend_buffer_set_usage(ctx->buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    auto fin = open_ifstream_binary(ctx->lazy_fname);
+    std::vector<uint8_t> read_buf;
+    for (const auto & [name, offset] : ctx->lazy_tensors) {
+        ggml_tensor * cur = ggml_get_tensor(ctx->ctx_data.get(), name.c_str());
+        GGML_ASSERT(cur && "tensor not found in ctx_data");
+        read_buf.resize(ggml_nbytes(cur));
+        fin.seekg(offset, std::ios::beg);
+        fin.read(reinterpret_cast<char *>(read_buf.data()), read_buf.size());
+        if (!fin) {
+            LOG_ERR("%s: failed to read tensor %s from %s\n", __func__, name.c_str(), ctx->lazy_fname.c_str());
+            ctx->buf.reset();
+            return false;
+        }
+        ggml_backend_tensor_set(cur, read_buf.data(), 0, read_buf.size());
+    }
+    ctx->lazy_pending = false;
+    LOG_INF("%s: loaded %.2f MiB of weights to %s\n", __func__, ggml_backend_buffer_get_size(ctx->buf.get())/1024.0/1024.0, ggml_backend_buft_name(buft));
+    return true;
+}
+
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    if (!clip_load_lazy_weights(ctx)) {
+        return false;
+    }
+
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 

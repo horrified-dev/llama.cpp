@@ -90,7 +90,8 @@ def header(svg, title, subtitle, legend=None, kind="bar"):
             x += off + text_w(label, 12.5) + 22
 
 
-def hbar_chart(name, mode, title, subtitle, cats, series, xmax, xstep, note, fmt="{:.1f}", desc=""):
+def hbar_chart(name, mode, title, subtitle, cats, series, xmax, xstep, note, fmt="{:.1f}", desc="",
+               xlabel="tokens per second", xtick_fmt="{}"):
     t = THEMES[mode]
     n_s = len(series)
     thick, gap = 18, 2
@@ -106,10 +107,12 @@ def hbar_chart(name, mode, title, subtitle, cats, series, xmax, xstep, note, fmt
     def sx(v):
         return x0 + (x1 - x0) * v / xmax
 
-    for v in range(0, xmax + 1, xstep):
+    n_ticks = int(round(xmax / xstep))
+    for i in range(n_ticks + 1):
+        v = i * xstep
         svg.line(sx(v), top, sx(v), top + plot_h, "grid")
-        svg.text(sx(v), top + plot_h + 14, f"{v}", size=11, color="muted", anchor="middle")
-    svg.text((x0 + x1) / 2, top + plot_h + 34, "tokens per second", size=11, color="muted", anchor="middle")
+        svg.text(sx(v), top + plot_h + 14, xtick_fmt.format(v), size=11, color="muted", anchor="middle")
+    svg.text((x0 + x1) / 2, top + plot_h + 34, xlabel, size=11, color="muted", anchor="middle")
     for ci, cat in enumerate(cats):
         yc = top + band * ci + band / 2
         svg.text(x0 - 12, yc, cat, size=12.5, color="ink", anchor="end")
@@ -153,8 +156,10 @@ def line_chart(name, mode, title, subtitle, xs, xticks, series, ymax, ystep, yfm
         vx, vlabel = vline
         svg.line(sx(vx), y1, sx(vx), y0, "base")
         svg.text(sx(vx) + 6, y1 + 8, vlabel, size=11, color="ink2")
-    for _, color, ys, end_label in series:
-        pts = [(sx(x), sy(y)) for x, y in zip(xs, ys)]
+    for s_ in series:
+        _, color, ys, end_label = s_[:4]
+        s_xs = s_[4] if len(s_) > 4 else xs
+        pts = [(sx(x), sy(y)) for x, y in zip(s_xs, ys)]
         svg.polyline(pts, color)
         for x, y in pts:
             svg.dot(x, y, color)
@@ -315,14 +320,44 @@ def main():
             fmt="{:.0f}", desc="487, 761, 1135 tok/s.")
         hbar_chart(
             "prefill-before-after", mode,
-            "Prefill speed: expert streaming and VRAM as you go",
+            "Prefill speed in three rounds",
             "Huihui-Qwen3.6-35B-A3B Q8_0 + vision projector + MTP, 128K context, same prompts",
-            ["3.5K-token agentic turn", "11.2K-token agentic turn", "16.7K-token prompt", "112K-token prompt"],
-            [("Before (-ub 1024)", "gray", [538, 608, 613, 511]),
-             ("Now (-ub 2048, streaming)", "s1", [1085, 1128, 1309, 914])],
-            1400, 200,
-            "Before: this fork on 2026-10-13. Now: expert streaming, positional attention mask, growing KV cache.",
-            fmt="{:.0f}", desc="Before: 538, 608, 613, 511 tok/s. Now: 1085, 1128, 1309, 914 tok/s.")
+            ["3.5K-token agentic turn", "11.2K-token agentic turn", "16.8K-token prompt", "112K-token prompt"],
+            [("2026-10-13 (-ub 1024)", "gray", [538, 608, 613, 511]),
+             ("Expert streaming (-ub 2048)", "s4", [1085, 1128, 1309, 914]),
+             ("Now (-ub 4096, CPU+GPU experts, new kernels)", "s1", [1678, 2029, 1942, 1260])],
+            2400, 400,
+            "Streaming: expert uploads overlap compute, positional mask, growing KV cache. Now: see the next charts.",
+            fmt="{:.0f}", desc="2026-10-13: 538, 608, 613, 511 tok/s. Streaming: 1085, 1128, 1309, 914 tok/s. "
+                               "Now: 1678, 2029, 1942, 1260 tok/s.")
+        line_chart(
+            "prompt-chunks", mode,
+            "Mid-size prompt chunks: CPU and GPU on the same layer",
+            "Time to process a chunk of new tokens (tool outputs), Huihui-Qwen3.6-35B-A3B Q8_0, 128K profile",
+            [115, 1422], [(v, str(v)) for v in (128, 256, 512, 1024)],
+            [("Expert streaming: GPU path", "gray", [0.57, 0.75, 0.92, 0.99, 1.13, 1.25, 1.33, 1.36, 1.39], "",
+              [115, 169, 208, 278, 370, 502, 668, 937, 1422]),
+             ("Now: experts split CPU/GPU", "s1", [0.48, 0.61, 0.69, 0.78, 0.87, 0.97, 1.11, 1.34, 1.39], "",
+              [117, 183, 244, 311, 392, 492, 646, 903, 1349])],
+            1.6, 0.2, "{:.1f}", "seconds",
+            ("x-axis: new prompt tokens (log scale). Up to 768 tokens, the CPU computes 465/(465 + tokens) of each RAM",
+             "layer's experts while the GPU uploads and computes the rest; larger chunks stream whole layers as before."),
+            logx=True, vline=(768, "LLAMA_MOE_HYBRID_MAX=768"),
+            desc="GPU path: 0.57 s at 115 tokens, 0.92 s at 208, 1.25 s at 502, 1.39 s at 1422. "
+                 "CPU+GPU split: 0.48 s at 117, 0.69 s at 244, 0.97 s at 492, 1.39 s at 1349.")
+        hbar_chart(
+            "prefill-kernels", mode,
+            "Prefill: four GPU kernels that were far from the hardware limits",
+            "One 4096-token micro-batch of Qwen3.6-35B-A3B on the RTX 3060 (test-backend-ops)",
+            ["Gated DeltaNet recurrence", "Conv input concatenation", "RMS norm, 64K rows of 128",
+             "Attention, q8_0/q4_0 KV, 16K cells"],
+            [("Before", "gray", [7.92, 1.61, 0.40, 6.79]),
+             ("Now", "s1", [4.17, 0.88, 0.22, 6.11])],
+            9, 1,
+            "Per layer: 30 Gated DeltaNet layers and 10 attention layers. The attention row is for 512 queries.",
+            fmt="{:.2f} ms", desc="Gated DeltaNet 7.92 -> 4.17 ms, concat 1.61 -> 0.88 ms, RMS norm 0.40 -> 0.22 ms, "
+                                  "attention 6.79 -> 6.11 ms.",
+            xlabel="milliseconds")
         stacked_bar_chart(
             "step-breakdown", mode,
             "Where the time of one decode step goes",

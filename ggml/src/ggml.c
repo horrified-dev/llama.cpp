@@ -3425,6 +3425,14 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_range(struct ggml_tensor * a, int32_t id_lo, int32_t id_hi, bool zero_rest) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(id_lo >= 0 && id_hi > id_lo && id_hi - id_lo == a->src[0]->ne[2]);
+    ggml_set_op_params_i32(a, 0, id_lo);
+    ggml_set_op_params_i32(a, 1, id_hi);
+    ggml_set_op_params_i32(a, 2, zero_rest ? 1 : 0);
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

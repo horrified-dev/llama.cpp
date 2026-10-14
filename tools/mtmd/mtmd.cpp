@@ -2353,6 +2353,10 @@ bool mtmd_support_vision(const mtmd_context * ctx) {
     return ctx->ctx_v != nullptr;
 }
 
+size_t mtmd_get_pending_device_bytes(const mtmd_context * ctx) {
+    return clip_get_pending_device_bytes(ctx->ctx_v) + clip_get_pending_device_bytes(ctx->ctx_a);
+}
+
 bool mtmd_support_audio(const mtmd_context * ctx) {
     return ctx->ctx_a != nullptr;
 }

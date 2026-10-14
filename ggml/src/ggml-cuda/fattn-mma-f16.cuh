@@ -487,27 +487,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 // dequantize 8 consecutive values starting at value i0 of a quantized K/V row, i0 % 8 == 0
 template<ggml_type type_KV>
 static __device__ __forceinline__ void flash_attn_ext_f16_dequantize_8(const char * __restrict__ row, const int i0, half2 * __restrict__ dst) {
+    // the integers are converted by placing them in the mantissa of 1024.0h (exact for 0..1023): the products with the
+    // f16 scale are exact in f32, so this is bit-identical to rounding d*x from f32
     if constexpr (type_KV == GGML_TYPE_Q8_0) {
         const block_q8_0 * b = (const block_q8_0 *) row + i0/QK8_0;
-        const float d = __half2float(b->d);
+        const half2 d2 = __half2half2(b->d);
+        const half2 o2 = make_half2(1152.0f, 1152.0f); // 1024 + 128
         // the blocks are 2 byte aligned
         const uint16_t * qs = (const uint16_t *) (b->qs + i0 % QK8_0);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const uint16_t q = qs[j];
-            dst[j] = __floats2half2_rn(d*float(int8_t(q & 0xFF)), d*float(int8_t(q >> 8)));
+        for (int j = 0; j < 2; ++j) {
+            // 4 values as unsigned bytes x + 128
+            const uint32_t q = (uint32_t(qs[2*j + 0]) | (uint32_t(qs[2*j + 1]) << 16)) ^ 0x80808080u;
+            const uint32_t lo = __byte_perm(q, 0x64646464u, 0x5140);
+            const uint32_t hi = __byte_perm(q, 0x64646464u, 0x7362);
+            dst[2*j + 0] = __hmul2(__hsub2(*(const half2 *) &lo, o2), d2);
+            dst[2*j + 1] = __hmul2(__hsub2(*(const half2 *) &hi, o2), d2);
         }
     } else if constexpr (type_KV == GGML_TYPE_Q4_0) {
         const block_q4_0 * b = (const block_q4_0 *) row + i0/QK4_0;
-        const float d = __half2float(b->d);
+        const half2 d2 = __half2half2(b->d);
+        const half2 o2 = make_half2(1032.0f, 1032.0f); // 1024 + 8
         // values 0..15 are the low nibbles of qs, values 16..31 the high nibbles
         const int iqs   = i0 % QK4_0;
         const int shift = iqs < QK4_0/2 ? 0 : 4;
         const uint16_t * qs = (const uint16_t *) (b->qs + iqs % (QK4_0/2));
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const uint16_t q = qs[j] >> shift;
-            dst[j] = __floats2half2_rn(d*float(int(q & 0x0F) - 8), d*float(int((q >> 8) & 0x0F) - 8));
+            const uint32_t t = __byte_perm(uint32_t(qs[j]), 0u, 0x4140); // the 2 bytes in the low bytes of the halves
+            const uint32_t h = ((t >> shift) & 0x000F000Fu) | 0x64006400u;
+            dst[j] = __hmul2(__hsub2(*(const half2 *) &h, o2), d2);
         }
     } else {
         static_assert(type_KV == GGML_TYPE_Q8_0, "unsupported K/V type");
@@ -566,7 +575,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const int stride_mask, const int k_VKQ_0, const int i_sup, const int j0, const uint3 ne01,
         const int32_t * const __restrict__ indices) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    if constexpr (!use_cp_async && !use_sparse) {
+    if constexpr (!use_sparse) {
         if (stride_mask < 0) {
             // positional mask (see ggml_flash_attn_ext): mask_h holds the positions, the row stride is -n_kv
             const int32_t * pos = (const int32_t *) mask_h;

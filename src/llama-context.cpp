@@ -332,6 +332,7 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    n_ubatch_max     = cparams.n_ubatch;
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -1500,46 +1501,105 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-void llama_context::adapt_stream_slots() {
-    static const int slots_max = getenv("GGML_SCHED_STREAM_WEIGHTS") ? atoi(getenv("GGML_SCHED_STREAM_WEIGHTS")) : 0;
-    if (slots_max <= 2 || !sched) {
-        return;
-    }
-    const int slots = ggml_backend_sched_get_stream_slots(sched.get());
-    if (slots < 2) {
-        return;
-    }
-    ggml_backend_dev_t dev = nullptr;
+ggml_backend_dev_t llama_context::gpu_device() const {
     for (auto * backend : backend_ptrs) {
         ggml_backend_dev_t d = ggml_backend_get_device(backend);
         if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            dev = d;
-            break;
+            return d;
         }
     }
+    return nullptr;
+}
+
+void llama_context::set_ubatch_size(uint32_t n) {
+    size_t before = 0;
+    for (auto * backend : backend_ptrs) {
+        before += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+    }
+    cparams.n_ubatch   = n;
+    sched_need_reserve = true;
+    sched_reserve(); // a new scheduler with buffers for n
+    size_t after = 0;
+    for (auto * backend : backend_ptrs) {
+        after += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+    }
+    if (after < before) {
+        ubatch_saved = before - after;
+    }
+    LLAMA_LOG_INFO("%s: micro-batch size %u\n", __func__, n);
+}
+
+void llama_context::set_stream_slots(int n) {
+    ggml_backend_sched_set_stream_slots(sched.get(), n);
+    gf_res_prev_active = nullptr; // the graph has to be allocated again
+    LLAMA_LOG_INFO("%s: %d slots for streamed weights\n", __func__, n);
+}
+
+static const int      llama_env_stream_slots = getenv("GGML_SCHED_STREAM_WEIGHTS") ? atoi(getenv("GGML_SCHED_STREAM_WEIGHTS")) : 0;
+static const uint32_t llama_env_ubatch_min   = getenv("LLAMA_UBATCH_MIN") ? (uint32_t) atoi(getenv("LLAMA_UBATCH_MIN")) : 0;
+
+void llama_context::adapt_memory() {
+    if (!sched) {
+        return;
+    }
+    const int  slots       = ggml_backend_sched_get_stream_slots(sched.get());
+    const bool adapt_slots = llama_env_stream_slots > 2 && slots >= 2;
+    const bool adapt_ub    = llama_env_ubatch_min > 0 && llama_env_ubatch_min < n_ubatch_max;
+    if (!adapt_slots && !adapt_ub) {
+        return;
+    }
+    ggml_backend_dev_t dev = gpu_device();
     if (dev == nullptr) {
         return;
     }
-    // the extra slots go first when the memory gets low, e.g. because the KV cache grows [LLAMA_KV_GROW]
     const size_t MiB = 1024*1024;
-    size_t free = 0;
+    size_t free  = 0;
     size_t total = 0;
     ggml_backend_dev_memory(dev, &free, &total);
-    int want = slots;
+
     if (free < 512*MiB) {
-        want = 2;
-    } else if (free > 1024*MiB) {
-        want = slots_max;
-    }
-    if (want != slots) {
-        LLAMA_LOG_INFO("%s: %zu MiB free on %s, using %d slots for streamed weights\n", __func__, free/MiB, ggml_backend_dev_name(dev), want);
-        ggml_backend_sched_set_stream_slots(sched.get(), want);
-        gf_res_prev_active = nullptr; // the graph has to be allocated again
+        // give back the bigger micro-batch first, then the extra slots
+        if (adapt_ub && cparams.n_ubatch > llama_env_ubatch_min) {
+            LLAMA_LOG_INFO("%s: %zu MiB free on %s\n", __func__, free/MiB, ggml_backend_dev_name(dev));
+            set_ubatch_size(llama_env_ubatch_min);
+        } else if (adapt_slots && slots > 2) {
+            LLAMA_LOG_INFO("%s: %zu MiB free on %s\n", __func__, free/MiB, ggml_backend_dev_name(dev));
+            set_stream_slots(2);
+        }
+    } else if (adapt_slots && slots < llama_env_stream_slots && free > 1024*MiB) {
+        set_stream_slots(llama_env_stream_slots);
+    } else if (adapt_ub && cparams.n_ubatch < n_ubatch_max && free > 768*MiB + std::max<size_t>(ubatch_saved, 256*MiB)) {
+        set_ubatch_size(n_ubatch_max);
     }
 }
 
+bool llama_context::make_device_memory(size_t bytes) {
+    ggml_backend_dev_t dev = gpu_device();
+    if (dev == nullptr || !sched) {
+        return true;
+    }
+    const size_t MiB = 1024*1024;
+    for (int step = 0; step < 3; ++step) {
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        if (free >= bytes + 256*MiB) {
+            return true;
+        }
+        const int slots = ggml_backend_sched_get_stream_slots(sched.get());
+        if (llama_env_ubatch_min > 0 && cparams.n_ubatch > llama_env_ubatch_min) {
+            set_ubatch_size(llama_env_ubatch_min);
+        } else if (slots > 2) {
+            set_stream_slots(2);
+        } else {
+            LLAMA_LOG_WARN("%s: %zu MiB free on %s, %zu MiB needed\n", __func__, free/MiB, ggml_backend_dev_name(dev), bytes/MiB);
+            return false;
+        }
+    }
+    return true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    adapt_stream_slots();
 
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1864,6 +1924,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+    // before the batch is split into micro-batches
+    adapt_memory();
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
@@ -2822,7 +2885,12 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
-    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+    // expert range of the mul_mat_id [ggml_mul_mat_id_set_range]: src holds the experts [id_lo, id_hi)
+    const int32_t id_lo  = node->op_params[0];
+    const int32_t id_hi  = node->op_params[1];
+    const bool    ranged = id_hi > id_lo;
+
+    if (ids != st.ids || (int64_t) st.used.size() != n_expert || st.id_lo != id_lo || st.id_hi != id_hi) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
         ggml_backend_synchronize(backend);
@@ -2830,13 +2898,21 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.used.assign(n_expert, false);
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
-                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                if (ranged) {
+                    if (id < id_lo || id >= id_hi) {
+                        continue;
+                    }
+                    id -= id_lo;
+                }
                 GGML_ASSERT(id >= 0 && id < n_expert);
                 st.used[id] = true;
             }
         }
 
-        st.ids = ids;
+        st.ids   = ids;
+        st.id_lo = id_lo;
+        st.id_hi = id_hi;
     }
 
     // group consecutive experts and copy them together
@@ -2885,6 +2961,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // the CPU part of a hybrid MoE layer [LLAMA_MOE_HYBRID]
+        if (backend_cpu && strncmp(name, "ffn_moe_cpu", 11) == 0) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+            return;
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -4186,6 +4268,10 @@ uint32_t llama_n_batch(const llama_context * ctx) {
 
 uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
+}
+
+bool llama_make_device_memory(llama_context * ctx, size_t bytes) {
+    return ctx->make_device_memory(bytes);
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

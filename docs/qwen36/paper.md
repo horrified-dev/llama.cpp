@@ -502,6 +502,73 @@ Outputs are bit-identical (greedy text and top-5 probabilities), and decoding sp
 pass is now close to its upload bound (34 layers x 855 MB at 25.8 GB/s, 1.13 s); deep into the context, the
 attention itself (about 4 x n_batch x n_kv x 256 x 16 FLOPs per layer) becomes the larger cost.
 
+## 13. Addendum (2026-10-14, evening): with the uploads hidden, the GPU is the bottleneck
+
+**Larger micro-batches, paid for by memory that is not needed yet.** The vision projector (1.1 GB of VRAM) is now
+loaded with the first image instead of at startup (`LLAMA_MMPROJ_LAZY=1`; before encoding, the server asks the context
+to make room). The memory allows micro-batches of 4096 tokens, which halve the number of passes over the streamed
+experts. Before each micro-batch, a small "memory ladder" in `llama_context` checks the free VRAM: below 512 MiB it
+re-reserves the graph for 2048-token micro-batches (`LLAMA_UBATCH_MIN`), then drops the third streaming slot, and it
+climbs back when the KV cache leaves room again. VRAM at start: 10.1 GB.
+
+**CPU and GPU on the same layer.** Chunks of 64-768 tokens, typical tool outputs, still route to nearly every expert,
+so the GPU path is bound by the upload and the CPU path by DDR4. Splitting the experts of each RAM-resident layer runs
+both at once: the CPU computes the experts [0, k0) while the GPU uploads and computes [k0, 256). `ggml_mul_mat_id`
+gets an optional expert range (operator parameters, implemented by the CPU and by CUDA MMQ), the graph places the two
+halves on the two devices and sums them, and the CPU share is c / (c + n_tokens) with c = 465 tokens
+(`LLAMA_MOE_HYBRID`). Chunks of 115-670 tokens get 7-18% faster (0.92 -> 0.75 s at 208 tokens), with the same KL
+divergence as the stock CPU path.
+
+**Profile.** CUDA events on both streams of a 4096-token micro-batch showed the 26 GB of expert uploads (1.0 s) fully
+hidden behind 1.6 s of compute: from here on, prompt processing is bound by the GPU itself. Per layer and micro-batch,
+the expert matmuls take about 16 ms (gate 4.3, up 5.0, down 7.5 ms; the down projection's K of 512 leaves the MMQ tiles
+little work to hide their fixed cost behind), and the rest of a Gated DeltaNet layer took about 26 ms. Four kernels in
+that rest were far from their hardware limits:
+
+| Kernel (Qwen3.6 shapes, 4096-token micro-batch) | Before | After |
+|---|---|---|
+| Gated DeltaNet recurrence (16 q/k heads, 32 v heads of 128) | 7.9 ms | 4.2 ms |
+| Conv state + transposed conv input concatenation (8192 channels) | 1.61 ms | 0.88 ms |
+| RMS norm, 65,536 rows of 128 | 0.40 ms | 0.22 ms |
+| Attention over a q8_0 K / q4_0 V cache, 16K cells, 512 queries | 6.8 ms | 6.1 ms |
+
+- The recurrence ran each state column on 8 lanes and re-read q, k, v, g and beta of every token from global memory.
+  It now stages 8 tokens at a time in shared memory, keeps 16 rows of 2 columns per lane, and computes S^T k and S^T q
+  together from the previous state (S'^T q = g S^T q + delta (k . q)), so one reduction serves both; the 128 CTAs fit
+  in a single wave (5 per SM, 90 registers).
+- The concatenation read its transposed input element by element; a 32 x 32 tiled transpose through shared memory
+  makes both reads and writes coalesced.
+- The RMS norm used a 256-thread block for each 128-element row. Rows of up to 256 elements now get one warp each, 8
+  rows per block, but only when there are at least 4096 rows: for decode-sized batches the warp version left most SMs
+  idle and cost 5% of the decoding speed.
+- The quantized-KV attention converted int8 and nibbles to f16 through f32. Placing the integer in the mantissa of
+  1024.0h (one byte permute, one subtraction) and multiplying by the f16 scale is bit-identical, since the products are
+  exact in f32, and 11% faster. Converting the whole KV range to f16 first and running the f16 kernel is another ~10%
+  faster with the positional mask, at the cost of up to 256 MB of pool memory at 128K; it is optional
+  (`GGML_CUDA_FA_F16_MIN_BATCH`, from 32K cells) and off in the reference profile.
+
+**The noise floor of a KL divergence check.** On this model, anything that changes rounding scores a KL divergence of
+about 0.006 against the previous output: a one-ulp change of the delta net's output scale gives 0.0060 with 97.9%
+identical top tokens, and all four kernels together give 0.0058 (perplexity ratio 0.9997 +- 0.0023). Routing near-ties
+(top 8 of 256 experts) and the q4_0 V cache turn rounding differences into discrete changes, so only bit-identical
+paths score 0. Per-operator errors against the CPU reference (`test-backend-ops`, NMSE 1e-12 to 1e-15 for the new
+recurrence, as for the old one) are the better check.
+
+| Same prompts (128K profile) | 2026-10-13 | Section 12 | Now |
+|---|---|---|---|
+| 3.5K-token turn | 538 tok/s | 1085 tok/s | 1678 tok/s |
+| 11.2K-token turn | 608 tok/s | 1128 tok/s | 2029 tok/s |
+| 16.8K-token prompt | 613 tok/s | 1309 tok/s | 1942 tok/s |
+| 112K-token prompt | 511 tok/s | 914 tok/s | 1260 tok/s |
+| VRAM at start / peak at 112K | 11.53 / 11.62 GB | 10.77 / 11.55 GB | 10.11 / 11.25 GB |
+
+Decoding speed is unchanged (42.4 tok/s greedy, 40.6 sampled). Measured and dropped: smaller MMQ tiles for the expert
+matmuls (128 tokens per tile is the fastest at 4096 tokens), staging the raw quantized K/V tiles with `cp.async`
+(slower: the conversion and MMA phases still alternate inside a CTA), and larger MTP micro-batches (+700 MiB of VRAM
+for about 2.5%). RAM is now the tighter side: about 1.4 GB of the 32 GB is free at start, and a session's context
+checkpoints (60-90 MB each) and speculative-decoding buffers take most of it; with `--ctx-checkpoints 2` the lowest
+free RAM over the whole benchmark set was 475 MiB.
+
 ---
 
 ## References
@@ -549,4 +616,14 @@ python3 scripts/qwen36/make_charts.py   # regenerate the figures
 | `LLAMA_MOE_PREFETCH_US=<us>` | time budget of one prefetch, default 1000 |
 | `LLAMA_MOE_PREFETCH_MAX_TOKENS=<n>` | largest batch to prefetch for, default 4 |
 | `LLAMA_MTP_SWA=<tokens>` | sliding window of the MTP draft head's KV cache |
+| `LLAMA_MTP_UBATCH=<n>` | micro-batch size of the MTP draft context (prompt processing) |
+| `GGML_SCHED_STREAM_WEIGHTS=<slots>` | stream host experts to the GPU on a second stream through `slots` slots (Section 12) |
+| `GGML_SCHED_STREAM_MIN_BATCH=<n>` | smallest batch that streams whole expert tensors, default 512 |
+| `LLAMA_FA_POS_MASK=1` | positional causal mask instead of the F16 KQ mask (Section 12) |
+| `LLAMA_KV_GROW=1` | the KV cache maps VRAM as the conversation grows (Section 12) |
+| `LLAMA_MMPROJ_LAZY=1` | load the vision projector with the first image (Section 13) |
+| `LLAMA_UBATCH_MIN=<n>` | micro-batch size the memory ladder falls back to when VRAM runs short (Section 13) |
+| `LLAMA_MOE_HYBRID=<c>`, `LLAMA_MOE_HYBRID_MAX=<n>` | split the experts of a host layer between CPU and GPU for batches up to `n` tokens (Section 13) |
+| `GGML_CUDA_GDN_PREFILL=0` | disable the shared-memory Gated DeltaNet kernel for prompt processing |
+| `GGML_CUDA_FA_F16_MIN_BATCH=<n>` | convert a quantized KV range to f16 for batches of `n`+ tokens (Section 13, off by default) |
 | `GGML_OP_OFFLOAD_MIN_BATCH=<n>` | (upstream) smallest batch whose host experts are uploaded to the GPU |

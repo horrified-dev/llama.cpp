@@ -2150,6 +2150,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    // an expert range [ggml_mul_mat_id_set_range] is only implemented by MMQ
+    if (ggml_get_op_params_i32(dst, 1) > ggml_get_op_params_i32(dst, 0)) {
+        GGML_ASSERT(ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02) && "expert range needs MMQ");
+        ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        return;
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);

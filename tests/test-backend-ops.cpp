@@ -6980,6 +6980,13 @@ struct test_concat : public test_case {
 
             b = ggml_view_4d(ctx, b, ne_b[0], ne_b[1], ne_b[2], ne_b[3], b->nb[1], b->nb[2], b->nb[3], 0);
             ggml_set_name(b, "view_of_b");
+        } else if (v & 16) {
+            // transposed b, as the inputs of a convolution appended to its state
+            b = ggml_new_tensor_4d(ctx, type, ne_b[1], ne_b[0], ne_b[2], ne_b[3]);
+            ggml_set_name(b, "b");
+
+            b = ggml_transpose(ctx, b);
+            ggml_set_name(b, "transposed_b");
         } else {
             b = ggml_new_tensor(ctx, type, 4, ne_b.data());
             ggml_set_name(b, "b");
@@ -8487,6 +8494,48 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+
+// mul_mat_id restricted to an expert range, see ggml_mul_mat_id_set_range
+struct test_mul_mat_id_range : public test_case {
+    const ggml_type type_a;
+    const int n_expert; // experts the ids refer to
+    const int id_lo;
+    const int id_hi;
+    const int n_used;
+    const bool b_bcast; // one input per token (gate/up) or per slot (down)
+    const int64_t m;
+    const int64_t n;    // tokens
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_a, n_expert, id_lo, id_hi, n_used, b_bcast, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_id_range(ggml_type type_a = GGML_TYPE_Q8_0, int n_expert = 32, int id_lo = 8, int id_hi = 24, int n_used = 4,
+            bool b_bcast = true, int64_t m = 128, int64_t n = 256, int64_t k = 256)
+        : type_a(type_a), n_expert(n_expert), id_lo(id_lo), id_hi(id_hi), n_used(n_used), b_bcast(b_bcast), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as  = ggml_new_tensor_3d(ctx, type_a, k, m, id_hi - id_lo);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * ids_v = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b_bcast ? 1 : n_used, n);
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids_v);
+        ggml_mul_mat_id_set_range(out, id_lo, id_hi, true);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_expert);
+        init_mul_mat_id_tensors(ctx, n_expert);
+    }
+};
 
 // flash attention with a positional causal mask (I32 positions instead of an F16 mask), see ggml_flash_attn_ext
 struct test_flash_attn_ext_pos : public test_case {
@@ -10519,6 +10568,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+    // many short rows (one warp per row)
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 64, 64, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {100, 30, 70, 2}, true, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {128, 32, 130, 1}, 1e-6f, false, false, false, false, true));
+    test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {256, 17, 300, 1}, 1e-6f, false));
     // shapes below exceed the CUDA gridDim.y/gridDim.z limit of 65535 (#27901)
     test_cases.emplace_back(new test_norm        (GGML_TYPE_F32, {4, 1, 65536, 1}, false, 1e-6f));
     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 65536, 1}, false, 1e-6f, false));
@@ -11410,6 +11464,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // transposed b (conv inputs appended to the conv state of linear attention layers)
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 100, 2, 1}, 77, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 33, 2, 3}, 40, 0, 17));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {5, 64, 1, 1}, 70, 0, 16));
+
     // few long rows, which backends may split across workgroups
     for (int dim : { 0, 1 }) {
         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98304, 8, 1, 1}, dim == 0 ? 288 : 2, dim, 0));
@@ -11954,6 +12014,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    // prompt processing with 128 wide heads
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 77, 2, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 40, 1, 1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 45, 2, 2, false, false, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 33, 1, 1, false, false, 40));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 1, 128, 300, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
@@ -12003,6 +12070,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 48, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 2, 128, 40, 2, 4));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
@@ -12036,6 +12105,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_V : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
         for (int64_t nb : { 1, 3, 8, 64 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, type_V));
+        }
+    }
+
+    // mul_mat_id restricted to an expert range
+    for (bool b_bcast : {true, false}) {
+        for (int64_t n : {256, 600}) {
+            test_cases.emplace_back(new test_mul_mat_id_range(GGML_TYPE_Q8_0, 32,  8, 24, 4, b_bcast, 128, n, 256));
+            test_cases.emplace_back(new test_mul_mat_id_range(GGML_TYPE_Q8_0, 64,  0, 20, 8, b_bcast, 128, n, 256));
+            test_cases.emplace_back(new test_mul_mat_id_range(GGML_TYPE_Q8_0, 64, 20, 64, 8, b_bcast, 128, n, 256));
         }
     }
 

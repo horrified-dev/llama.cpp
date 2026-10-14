@@ -290,13 +290,25 @@ void ggml_cuda_mul_mat_q(
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
 
+    // expert range [ggml_mul_mat_id_set_range]: only the rows of experts [id_lo, id_hi) are computed, the others are 0
+    const int32_t id_lo  = ggml_get_op_params_i32(dst, 0);
+    const int32_t id_hi  = ggml_get_op_params_i32(dst, 1);
+    const bool    ranged = id_hi > id_lo;
+    if (ranged) {
+        if (ggml_get_op_params_i32(dst, 2)) {
+            CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
+        }
+        // the rows of skipped slots are not written by the helper: -1 is skipped by the scatter, 0 is a valid source row
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), dedup_bcast ? 0xFF : 0, ne_get_rows*sizeof(int32_t), stream));
+    }
+
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, ranged ? id_lo : 0, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 

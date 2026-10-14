@@ -71,6 +71,9 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 // max number of output tokens per image, -1 if not dynamic size
 int clip_get_image_max_tokens(const struct clip_ctx * ctx);
 
+// device memory that a lazily loaded projector still needs (weights plus an estimate of the compute buffer) [LLAMA_MMPROJ_LAZY]
+size_t clip_get_pending_device_bytes(const struct clip_ctx * ctx);
+
 void clip_free(struct clip_ctx * ctx);
 
 // TODO: should be enum, not string

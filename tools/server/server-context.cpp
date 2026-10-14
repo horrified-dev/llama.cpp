@@ -817,6 +817,11 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    // a lazily loaded projector takes its device memory now [LLAMA_MMPROJ_LAZY]
+    if (const size_t need = mtmd_get_pending_device_bytes(mctx)) {
+        llama_make_device_memory(slot.ctx_tgt, need);
+    }
+
     res = mtmd_batch_encode(mbatch.get());
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);

@@ -175,6 +175,207 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+// prefill kernel for S_v = 128 and a scalar gate: the inputs of gdn_pf_tc tokens are staged in shared memory,
+// each lane keeps 16 rows of gdn_pf_cpl state columns and S^T k, S^T q are reduced together from the old state:
+//   delta = beta * (v - g * S^T k), S' = g * S + k delta^T, S'^T q = g * S^T q + delta * (k.q)
+constexpr int gdn_pf_tc   = 8;  // tokens per chunk
+constexpr int gdn_pf_cpl  = 2;  // state columns per lane
+constexpr int gdn_pf_nw   = 4;  // warps per CTA
+constexpr int gdn_pf_lpc  = 8;  // lanes per state column
+constexpr int gdn_pf_cols = (32 / gdn_pf_lpc) * gdn_pf_cpl * gdn_pf_nw; // state columns per CTA
+
+template <bool keep_rs_t>
+__global__ void __launch_bounds__(32 * gdn_pf_nw, 5)
+gated_delta_net_prefill_cuda(const float * __restrict__ q,
+                             const float * __restrict__ k,
+                             const float * __restrict__ v,
+                             const float * __restrict__ g,
+                             const float * __restrict__ beta,
+                             const float * __restrict__ curr_state,
+                             float *       __restrict__ dst,
+                             float *       __restrict__ state,
+                             int64_t       H,
+                             int64_t       n_tokens,
+                             int64_t       sq1,
+                             int64_t       sq2,
+                             int64_t       sq3,
+                             int64_t       sv1,
+                             int64_t       sv2,
+                             int64_t       sv3,
+                             int64_t       sb1,
+                             int64_t       sb2,
+                             int64_t       sb3,
+                             const uint3   neqk1_magic,
+                             const uint3   rq3_magic,
+                             float         scale,
+                             int64_t       state_slot_stride,
+                             int           K) {
+    constexpr int S_v  = 128;
+    constexpr int TC   = gdn_pf_tc;
+    constexpr int CPL  = gdn_pf_cpl;
+    constexpr int LPC  = gdn_pf_lpc;
+    constexpr int COLS = gdn_pf_cols;
+    constexpr int RPL  = S_v / LPC; // rows per lane, the float4 at rows 32*m + 4*l for m < RPL/4
+    constexpr int NT   = 32 * gdn_pf_nw;
+
+    __shared__ float4 ks[TC][S_v/4];
+    __shared__ float4 qs[TC][S_v/4];
+    __shared__ float  vs[TC][COLS];
+    __shared__ float  os[TC][COLS];
+    __shared__ float  gs[TC];
+    __shared__ float  bs[TC];
+    __shared__ float  kqs[TC];
+
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      col0     = blockIdx.z * COLS;
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid  = warp * 32 + lane;
+    const int l    = lane % LPC;                             // lane within the column group
+    const int lc   = (warp * (32 / LPC) + lane / LPC) * CPL; // first column of the lane within the CTA
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    const float * q_h = q + iq3 * sq3 + iq1 * sq1;
+    const float * k_h = k + iq3 * sq3 + iq1 * sq1;
+    const float * v_h = v + sequence * sv3 + h_idx * sv1 + col0;
+    const float * g_h = g    + sequence * sb3 + h_idx * sb1;
+    const float * b_h = beta + sequence * sb3 + h_idx * sb1;
+    float * attn_data = dst + (sequence * n_tokens * H + h_idx) * S_v + col0;
+
+    state      += (sequence * H + h_idx) * S_v * S_v;
+    curr_state += (sequence * H + h_idx) * S_v * S_v;
+
+    ggml_cuda_pdl_sync();
+
+    // the state is stored transposed: row col of M holds S[:, col]
+    float s[CPL][RPL];
+#pragma unroll
+    for (int c = 0; c < CPL; ++c) {
+        const float4 * src = (const float4 *) (curr_state + (col0 + lc + c) * S_v);
+#pragma unroll
+        for (int m = 0; m < RPL/4; ++m) {
+            const float4 x = src[8*m + l];
+            s[c][4*m + 0] = x.x;
+            s[c][4*m + 1] = x.y;
+            s[c][4*m + 2] = x.z;
+            s[c][4*m + 3] = x.w;
+        }
+    }
+
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += TC) {
+        const int nt = (int) min((int64_t) TC, n_tokens - t0);
+
+        __syncthreads(); // the previous chunk is consumed
+
+        for (int idx = tid; idx < nt * (S_v/4); idx += NT) {
+            const int tt = idx / (S_v/4);
+            const int i4 = idx % (S_v/4);
+            ks[tt][i4] = ((const float4 *) (k_h + (t0 + tt) * sq2))[i4];
+            qs[tt][i4] = ((const float4 *) (q_h + (t0 + tt) * sq2))[i4];
+        }
+        for (int idx = tid; idx < nt * COLS; idx += NT) {
+            const int tt = idx / COLS;
+            const int c  = idx % COLS;
+            vs[tt][c] = v_h[(t0 + tt) * sv2 + c];
+        }
+        if (tid < nt) {
+            gs[tid] = expf(g_h[(t0 + tid) * sb2]);
+            bs[tid] = b_h[(t0 + tid) * sb2];
+        }
+        __syncthreads();
+
+        for (int tt = warp; tt < nt; tt += gdn_pf_nw) {
+            const float4 a = ks[tt][lane];
+            const float4 b = qs[tt][lane];
+            const float  p = warp_reduce_sum(a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w);
+            if (lane == 0) {
+                kqs[tt] = p;
+            }
+        }
+        __syncthreads();
+
+        for (int tt = 0; tt < nt; ++tt) {
+            float kr[RPL];
+            float qr[RPL];
+#pragma unroll
+            for (int m = 0; m < RPL/4; ++m) {
+                const float4 a = ks[tt][8*m + l];
+                const float4 b = qs[tt][8*m + l];
+                kr[4*m + 0] = a.x; kr[4*m + 1] = a.y; kr[4*m + 2] = a.z; kr[4*m + 3] = a.w;
+                qr[4*m + 0] = b.x; qr[4*m + 1] = b.y; qr[4*m + 2] = b.z; qr[4*m + 3] = b.w;
+            }
+            const float g_val  = gs[tt];
+            const float b_val  = bs[tt];
+            const float kq_val = kqs[tt];
+
+            // (S^T k, S^T q) of the columns of the lane
+            float2 r[CPL];
+#pragma unroll
+            for (int c = 0; c < CPL; ++c) {
+                float a0 = 0.0f, a1 = 0.0f, b0 = 0.0f, b1 = 0.0f;
+#pragma unroll
+                for (int i = 0; i < RPL; i += 2) {
+                    a0 += s[c][i + 0] * kr[i + 0];
+                    a1 += s[c][i + 1] * kr[i + 1];
+                    b0 += s[c][i + 0] * qr[i + 0];
+                    b1 += s[c][i + 1] * qr[i + 1];
+                }
+                r[c] = warp_reduce_sum<LPC>(make_float2(a0 + a1, b0 + b1));
+            }
+
+#pragma unroll
+            for (int c = 0; c < CPL; ++c) {
+                const float delta = (vs[tt][lc + c] - g_val * r[c].x) * b_val;
+#pragma unroll
+                for (int i = 0; i < RPL; ++i) {
+                    s[c][i] = g_val * s[c][i] + kr[i] * delta;
+                }
+                if (l == 0) {
+                    os[tt][lc + c] = (g_val * r[c].y + delta * kq_val) * scale;
+                }
+            }
+
+            if constexpr (keep_rs_t) {
+                // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back
+                const int64_t target_slot = n_tokens - 1 - (t0 + tt);
+                if (target_slot < K) {
+                    float * snap = state + target_slot * state_slot_stride;
+#pragma unroll
+                    for (int c = 0; c < CPL; ++c) {
+                        float4 * d4 = (float4 *) (snap + (col0 + lc + c) * S_v);
+#pragma unroll
+                        for (int m = 0; m < RPL/4; ++m) {
+                            d4[8*m + l] = make_float4(s[c][4*m + 0], s[c][4*m + 1], s[c][4*m + 2], s[c][4*m + 3]);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < nt * COLS; idx += NT) {
+            const int tt = idx / COLS;
+            const int c  = idx % COLS;
+            attn_data[(t0 + tt) * S_v * H + c] = os[tt][c];
+        }
+    }
+
+    if constexpr (!keep_rs_t) {
+#pragma unroll
+        for (int c = 0; c < CPL; ++c) {
+            float4 * d4 = (float4 *) (state + (col0 + lc + c) * S_v);
+#pragma unroll
+            for (int m = 0; m < RPL/4; ++m) {
+                d4[8*m + l] = make_float4(s[c][4*m + 0], s[c][4*m + 1], s[c][4*m + 2], s[c][4*m + 3]);
+            }
+        }
+    }
+}
+
 template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -188,6 +389,25 @@ static void launch_gated_delta_net(
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    // prompt processing with 128 wide heads and a scalar gate: inputs staged in shared memory
+    if constexpr (!KDA) {
+        static const bool prefill_enabled = getenv("GGML_CUDA_GDN_PREFILL") == nullptr || atoi(getenv("GGML_CUDA_GDN_PREFILL")) != 0;
+        const bool aligned =
+            (uintptr_t) q_d % 16 == 0 && (uintptr_t) k_d % 16 == 0 && sq1 % 4 == 0 && sq2 % 4 == 0 && sq3 % 4 == 0 &&
+            (uintptr_t) s_d % 16 == 0 && (uintptr_t) state_d % 16 == 0 && state_slot_stride % 4 == 0;
+        if (prefill_enabled && S_v == 128 && n_tokens >= 32 && warp_size == 32 && aligned) {
+            const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+            const uint3 rq3_magic   = init_fastdiv_values(rq3);
+            const dim3 grid_dims(H, n_seqs, S_v / gdn_pf_cols);
+            const dim3 block_dims(32, gdn_pf_nw, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+            ggml_cuda_kernel_launch(gated_delta_net_prefill_cuda<keep_rs_t>, launch_params,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            return;
+        }
+    }
     // four columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
     // SMs without a CTA, so small head counts keep the device filled
     const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;

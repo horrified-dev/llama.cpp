@@ -1455,6 +1455,9 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // flash attention: K/V are converted to f16 in pool memory instead of the extra memory of dst [GGML_CUDA_FA_F16_MIN_BATCH]
+    bool fattn_f16_from_pool = false;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

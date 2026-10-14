@@ -342,6 +342,36 @@ static void ggml_cuda_flash_attn_ext_mma_q_switch_ncols1(ggml_backend_cuda_conte
     }
 }
 
+// [GGML_CUDA_FA_F16_MIN_BATCH=<n>] batches of at least n tokens with quantized K/V and at least GGML_CUDA_FA_F16_MIN_KV
+// cells: the f16 kernel is ~10% faster than converting K/V while loading them, so K/V are converted to f16 in pool memory
+// first if the device has the memory to spare (GGML_CUDA_FA_F16_MIN_FREE_MIB stay free). The pool keeps the memory.
+static bool ggml_cuda_fattn_q_convert_f16(const ggml_tensor * dst) {
+    static const int64_t min_batch = getenv("GGML_CUDA_FA_F16_MIN_BATCH") ? atoll(getenv("GGML_CUDA_FA_F16_MIN_BATCH")) : 0;
+    static const int64_t min_kv    = getenv("GGML_CUDA_FA_F16_MIN_KV") ? atoll(getenv("GGML_CUDA_FA_F16_MIN_KV")) : 32768;
+    static const size_t  min_free  = (getenv("GGML_CUDA_FA_F16_MIN_FREE_MIB") ? atoll(getenv("GGML_CUDA_FA_F16_MIN_FREE_MIB")) : 512) << 20;
+    static size_t        size_max[GGML_CUDA_MAX_DEVICES] = {0}; // the pool has grown to this size for the conversion before
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (min_batch <= 0 || Q->ne[1] < min_batch || K->ne[1] < min_kv) {
+        return false;
+    }
+
+    const int    device = ggml_cuda_get_device();
+    const size_t size   = (ggml_nelements(K) + ggml_nelements(V))*sizeof(half);
+    if (size > size_max[device]) {
+        size_t free  = 0;
+        size_t total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        if (free < size - size_max[device] + min_free) {
+            return false;
+        }
+        size_max[device] = size;
+    }
+    return true;
+}
+
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -351,6 +381,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     const ggml_tensor * mask = dst->src[3];
 
     if (ggml_cuda_fattn_mma_q_supported(cc, dst)) {
+        if (ggml_cuda_fattn_q_convert_f16(dst)) {
+            ctx.fattn_f16_from_pool = true;
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256>(ctx, dst);
+            ctx.fattn_f16_from_pool = false;
+            return;
+        }
         if (V->type == GGML_TYPE_Q8_0) {
             ggml_cuda_flash_attn_ext_mma_q_switch_ncols1<GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
         } else {

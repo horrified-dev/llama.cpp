@@ -1219,6 +1219,21 @@ struct llm_graph_context {
         GGML_UNUSED(il);
     }
 
+    // [LLAMA_MOE_HYBRID] the experts [0, k0) of a host-resident layer run on the CPU while the GPU runs [k0, n_expert),
+    // returns k0, 0 if the layer is not split
+    int64_t moe_hybrid_split(ggml_tensor * up_exps, ggml_tensor * gate_exps, ggml_tensor * down_exps, int64_t n_expert) const;
+
+    ggml_tensor * build_moe_ffn_hybrid(
+             ggml_tensor * cur,
+             ggml_tensor * selected_experts,
+             ggml_tensor * weights,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+                 int64_t   n_expert,
+                 int64_t   k0,
+                     int   il) const;
+
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     ggml_tensor * build_moe_cache_slots(
              ggml_tensor * selected_experts,

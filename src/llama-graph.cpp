@@ -2306,6 +2306,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // mid-size batches of a host-resident layer: part of the experts on the CPU, the rest on the GPU at the same time
+    if (!weight_before_ffn && slots == nullptr && !gate_up_exps && type_op == LLM_FFN_SILU && gate_exps &&
+        !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
+        (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f)) {
+        const int64_t k0 = moe_hybrid_split(up_exps, gate_exps, down_exps, n_expert);
+        if (k0 > 0) {
+            return build_moe_ffn_hybrid(cur, selected_experts, weights, up_exps, gate_exps, down_exps, n_expert, k0, il);
+        }
+    }
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -2507,6 +2517,149 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_out = ggml_cont(ctx0, moe_out);
     }
 
+    cb(moe_out, "ffn_moe_out", il);
+
+    return moe_out;
+}
+
+int64_t llm_graph_context::moe_hybrid_split(ggml_tensor * up_exps, ggml_tensor * gate_exps, ggml_tensor * down_exps, int64_t n_expert) const {
+    // LLAMA_MOE_HYBRID=<c>: the CPU takes the share c/(c + n_tokens) of the experts, c is about the number of tokens
+    // for which the CPU computes all experts of a layer in the time the GPU needs to upload them
+    static const double c = getenv("LLAMA_MOE_HYBRID") ? atof(getenv("LLAMA_MOE_HYBRID")) : 0.0;
+    static const int64_t n_min = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoll(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+    static const int64_t n_max = getenv("LLAMA_MOE_HYBRID_MAX") ? atoll(getenv("LLAMA_MOE_HYBRID_MAX")) : 2048;
+    if (c <= 0.0 || n_tokens < n_min || n_tokens > n_max || n_expert < 16) {
+        return 0;
+    }
+    for (const ggml_tensor * w : { up_exps, gate_exps, down_exps }) {
+        if (w == nullptr || w->buffer == nullptr || w->data == nullptr || !ggml_backend_buffer_is_host(w->buffer) ||
+            ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || w->ne[2] != n_expert) {
+            return 0;
+        }
+    }
+    const double f = c / (c + n_tokens);
+    return std::min<int64_t>(n_expert - 8, std::max<int64_t>(8, (int64_t) std::lround(f*n_expert)));
+}
+
+// out[:, t] = sum of weights[s, t]*down[:, s, t] over the slots s whose expert is in [0, k0), k0 = userdata
+// (the CPU part of a hybrid MoE layer: the rows of the other slots of down are undefined)
+static void moe_hybrid_weighted_sum(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const ggml_tensor * down = dst->src[0]; // [n_embd, n_used, n_tokens]
+    const ggml_tensor * w    = dst->src[1]; // [1, n_used, n_tokens]
+    const ggml_tensor * ids  = dst->src[2]; // [n_used, n_tokens]
+    const int32_t k0 = (int32_t) (intptr_t) userdata;
+
+    const int64_t n_embd   = down->ne[0];
+    const int64_t n_used   = down->ne[1];
+    const int64_t n_tokens = down->ne[2];
+
+    for (int64_t t = ith; t < n_tokens; t += nth) {
+        float * o = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            o[i] = 0.0f;
+        }
+        for (int64_t s = 0; s < n_used; ++s) {
+            const int32_t id = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + s*ids->nb[0]);
+            if (id < 0 || id >= k0) {
+                continue;
+            }
+            const float   ws = *(const float *) ((const char *) w->data + t*w->nb[2] + s*w->nb[1]);
+            const float * d  = (const float *) ((const char *) down->data + t*down->nb[2] + s*down->nb[1]);
+            for (int64_t i = 0; i < n_embd; ++i) {
+                o[i] += ws*d[i];
+            }
+        }
+    }
+}
+
+// the inputs of the CPU part are copied to the host by this op, before the GPU part is queued, so that the CPU part does
+// not have to wait for the GPU part
+static void moe_hybrid_touch(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(dst);
+    GGML_UNUSED(ith);
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+}
+
+ggml_tensor * llm_graph_context::build_moe_ffn_hybrid(
+         ggml_tensor * cur,
+         ggml_tensor * selected_experts,
+         ggml_tensor * weights,
+         ggml_tensor * up_exps,
+         ggml_tensor * gate_exps,
+         ggml_tensor * down_exps,
+             int64_t   n_expert,
+             int64_t   k0,
+                 int   il) const {
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[2];
+
+    {
+        ggml_tensor * args[3] = { cur, selected_experts, weights };
+        ggml_tensor * touch = ggml_custom_4d(ctx0, GGML_TYPE_I32, 1, 1, 1, 1, args, 3, moe_hybrid_touch, 1, nullptr);
+        cb(touch, "ffn_moe_cpu_touch", il);
+        ggml_build_forward_expand(gf, touch);
+    }
+
+    // experts [lo, hi) of up/gate/down, weighted and summed over the slots: [n_embd, n_tokens]
+    // the names of the CPU part start with ffn_moe_cpu, the graph callback places them on the CPU
+    // the GPU part zeroes the rows of the other slots and sums all slots, the CPU part sums only its own slots
+    auto part = [&](int64_t lo, int64_t hi, const char * name) -> ggml_tensor * {
+        const bool is_cpu = lo == 0;
+        auto view = [&](ggml_tensor * w) {
+            ggml_tensor * v = ggml_view_3d(ctx0, w, w->ne[0], w->ne[1], hi - lo, w->nb[1], w->nb[2], lo*w->nb[2]);
+            // a view of a weight in its buffer, so that the scheduler treats it as a host weight (offload, copies)
+            ggml_backend_view_init(v);
+            return v;
+        };
+        auto label = [&](ggml_tensor * t, const char * what) {
+            cb(t, (std::string(name) + "_" + what).c_str(), il);
+        };
+
+        ggml_tensor * up = ggml_mul_mat_id(ctx0, view(up_exps), cur, selected_experts);
+        ggml_mul_mat_id_set_range(up, (int32_t) lo, (int32_t) hi, !is_cpu);
+        label(up, "up");
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx0, view(gate_exps), cur, selected_experts);
+        ggml_mul_mat_id_set_range(gate, (int32_t) lo, (int32_t) hi, !is_cpu);
+        label(gate, "gate");
+
+        ggml_tensor * act = ggml_swiglu_split(ctx0, gate, up);
+        label(act, "swiglu");
+
+        ggml_tensor * down = ggml_mul_mat_id(ctx0, view(down_exps), act, selected_experts);
+        ggml_mul_mat_id_set_range(down, (int32_t) lo, (int32_t) hi, !is_cpu);
+        label(down, "down");
+
+        if (is_cpu) {
+            ggml_tensor * args[3] = { down, weights, selected_experts };
+            ggml_tensor * out = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1, args, 3,
+                moe_hybrid_weighted_sum, GGML_N_TASKS_MAX, (void *) (intptr_t) hi);
+            label(out, "sum");
+            ggml_build_forward_expand(gf, out);
+            return out;
+        }
+
+        ggml_tensor * weighted = ggml_mul(ctx0, down, weights);
+        label(weighted, "weighted");
+        ggml_build_forward_expand(gf, weighted);
+
+        ggml_tensor * out = nullptr;
+        for (int64_t i = 0; i < weighted->ne[1]; ++i) {
+            ggml_tensor * v = ggml_view_2d(ctx0, weighted, n_embd, n_tokens, weighted->nb[2], i*weighted->nb[1]);
+            out = out ? ggml_add(ctx0, out, v) : v;
+            if (i > 0) {
+                label(out, "sum");
+            }
+            ggml_build_forward_expand(gf, out);
+        }
+        return out;
+    };
+
+    ggml_tensor * out_gpu = part(k0, n_expert, "ffn_moe_gpu");
+    ggml_tensor * out_cpu = part(0, k0, "ffn_moe_cpu");
+
+    ggml_tensor * moe_out = ggml_add(ctx0, out_gpu, out_cpu);
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;

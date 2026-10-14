@@ -1496,6 +1496,10 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
 
+    // restrict a mul_mat_id to the experts [id_lo, id_hi): `as` holds only these experts (expert id - id_lo), the rows
+    // of dst whose expert is outside of the range are set to 0 if zero_rest, otherwise they are undefined
+    GGML_API void ggml_mul_mat_id_set_range(struct ggml_tensor * a, int32_t id_lo, int32_t id_hi, bool zero_rest);
+
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,

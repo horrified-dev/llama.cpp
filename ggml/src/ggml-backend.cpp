@@ -2050,9 +2050,10 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 
     // wait for the split backend to finish using the input before overwriting it
+    // (not needed for a slot of the weight ring: the copy is queued after the splits that used the slot)
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-    } else {
+    } else if (input_cpy->buffer == NULL || input_cpy->buffer != sched->ring_buf[split_backend_id]) {
         ggml_backend_synchronize(split_backend);
     }
 
@@ -2117,7 +2118,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id &&
+            sched->bufts[prev_backend_id] == sched->bufts[split_backend_id]) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {

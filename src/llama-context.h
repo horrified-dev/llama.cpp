@@ -58,8 +58,16 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
-    // with GGML_SCHED_STREAM_WEIGHTS > 2, use the slots beyond 2 only while the device has memory to spare
-    void adapt_stream_slots();
+    // use device memory for speed while it is spare, give it back when it gets low (e.g. as the KV cache grows):
+    // the micro-batch size between LLAMA_UBATCH_MIN and n_ubatch, then the streaming slots beyond 2 [GGML_SCHED_STREAM_WEIGHTS]
+    void adapt_memory();
+    bool make_device_memory(size_t bytes);
+    void set_ubatch_size(uint32_t n);
+    void set_stream_slots(int n);
+    ggml_backend_dev_t gpu_device() const;
+
+    uint32_t n_ubatch_max = 0; // the configured micro-batch size
+    size_t   ubatch_saved = 0; // device memory freed by the last switch to LLAMA_UBATCH_MIN
 
     void synchronize();
 
@@ -374,11 +382,14 @@ private:
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {
         const ggml_tensor *  ids = nullptr;
+        int32_t              id_lo = 0; // expert range of the mul_mat_id that filled used
+        int32_t              id_hi = 0;
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
 
         void reset() {
             ids = nullptr;
+            id_lo = id_hi = 0;
             ids_data.clear();
             used.clear();
         }
